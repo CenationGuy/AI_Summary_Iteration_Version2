@@ -1,6 +1,6 @@
 import argparse
 import json
-import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,10 +10,25 @@ import pandas as pd
 from google import genai
 from google.genai import types
 
-from config import (
-    PROJECT_ID,
-    GEMINI_MODEL,
-    VERTEX_LOCATION,
+import config
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+PROJECT_ID = config.PROJECT_ID
+
+GEMINI_MODEL = getattr(
+    config,
+    "GEMINI_MODEL",
+    "gemini-3.8-flash",
+)
+
+VERTEX_LOCATION = getattr(
+    config,
+    "VERTEX_LOCATION",
+    "global",
 )
 
 
@@ -29,8 +44,6 @@ TREND_FILE = Path(
     "output/page1_trend_points.csv"
 )
 
-# IMPORTANT:
-# Keep Iteration 1 output untouched.
 OUTPUT_FILE = Path(
     "output/page1_ai_summaries_iteration2.csv"
 )
@@ -39,307 +52,183 @@ LOG_FILE = Path(
     "output/page1_ai_generation_log_iteration2.csv"
 )
 
+RAW_FAILURE_DIR = Path(
+    "output/iteration2_failed_responses"
+)
+
 
 # ============================================================
-# MODEL SETTINGS
+# GENERATION SETTINGS
 # ============================================================
-
-THINKING_LEVEL = "MEDIUM"
 
 MAX_ATTEMPTS = 3
 
-MAX_OUTPUT_TOKENS = 2500
+RETRY_SLEEP_SECONDS = 2
+
+MAX_DISPLAY_MOM_PCT = 500
 
 
 # ============================================================
-# RESPONSE STRUCTURE
+# STRUCTURED OUTPUT SCHEMA
 #
-# Gemini directly creates the point-wise output.
+# IMPORTANT:
+# We use explicit fields instead of arrays.
 #
-# No paragraph -> point splitting afterwards.
+# This is more reliable than asking Gemini for:
+#
+# executive_summary: [...]
+# key_movements: [...]
+#
+# Every successful response has the exact same structure.
 # ============================================================
 
-RESPONSE_SCHEMA = {
-    "type": "OBJECT",
+SUMMARY_SCHEMA = {
+    "type": "object",
+
     "properties": {
-        "executive_summary": {
-            "type": "ARRAY",
-            "items": {
-                "type": "STRING"
-            },
+
+        "executive_point_1": {
+            "type": "string"
         },
-        "key_movements": {
-            "type": "ARRAY",
-            "items": {
-                "type": "STRING"
-            },
+
+        "executive_point_2": {
+            "type": "string"
         },
-        "trend_insight": {
-            "type": "ARRAY",
-            "items": {
-                "type": "STRING"
-            },
+
+        "key_movement_1": {
+            "type": "string"
         },
-        "budget_ytd": {
-            "type": "ARRAY",
-            "items": {
-                "type": "STRING"
-            },
+
+        "key_movement_2": {
+            "type": "string"
+        },
+
+        "key_movement_3": {
+            "type": "string"
+        },
+
+        "key_movement_4": {
+            "type": "string"
+        },
+
+        "trend_point_1": {
+            "type": "string"
+        },
+
+        "trend_point_2": {
+            "type": "string"
+        },
+
+        "budget_ytd_point_1": {
+            "type": "string"
+        },
+
+        "budget_ytd_point_2": {
+            "type": "string"
         },
     },
+
     "required": [
-        "executive_summary",
-        "key_movements",
-        "trend_insight",
-        "budget_ytd",
+
+        "executive_point_1",
+        "executive_point_2",
+
+        "key_movement_1",
+        "key_movement_2",
+        "key_movement_3",
+        "key_movement_4",
+
+        "trend_point_1",
+        "trend_point_2",
+
+        "budget_ytd_point_1",
+        "budget_ytd_point_2",
+    ],
+
+    "additionalProperties": False,
+
+    "propertyOrdering": [
+
+        "executive_point_1",
+        "executive_point_2",
+
+        "key_movement_1",
+        "key_movement_2",
+        "key_movement_3",
+        "key_movement_4",
+
+        "trend_point_1",
+        "trend_point_2",
+
+        "budget_ytd_point_1",
+        "budget_ytd_point_2",
     ],
 }
 
 
 # ============================================================
-# SYSTEM INSTRUCTION
+# REQUIRED OUTPUT FIELDS
 # ============================================================
 
-SYSTEM_INSTRUCTION = """
-You are an executive cash-flow analysis assistant.
+OUTPUT_FIELDS = [
 
-You analyse structured financial facts for a Cash Flow dashboard and
-produce concise but information-rich management commentary.
+    "executive_point_1",
+    "executive_point_2",
 
-Your job is NOT to simply repeat numbers.
+    "key_movement_1",
+    "key_movement_2",
+    "key_movement_3",
+    "key_movement_4",
 
-Your job is to identify what matters in the supplied facts and explain
-the current financial picture clearly.
+    "trend_point_1",
+    "trend_point_2",
 
-You must work ONLY from the supplied data.
-
-============================================================
-CORE RULES
-============================================================
-
-1. Never invent a number.
-
-2. Never invent a cause, operational explanation, seasonality,
-   management action, external event, or business reason.
-
-3. Never predict future performance.
-
-4. Never calculate a percentage that is not explicitly supplied.
-
-5. If a percentage field is null, use the absolute movement instead.
-
-6. When quoting amounts, use the provided display values rather than
-   recalculating or rescaling raw values.
-
-7. Never mix EUR and LC.
-
-8. For EUR, use the supplied € display values.
-
-9. For LC, use the supplied LC display values.
-   Never guess the entity's real local currency.
-
-10. Treat "above budget" and "below budget" as numerical positions.
-    Do not automatically describe them as favourable or unfavourable.
-
-11. Avoid unsupported causal wording such as:
-    "due to"
-    "caused by"
-    "driven by"
-    "because of"
-    "resulting from"
-    "seasonal"
-    "seasonality"
-
-12. Avoid vague corporate filler such as:
-    "softened"
-    "helping absorb"
-    "supported by"
-    "favourable"
-    "favorable"
-    "unfavourable"
-    "unfavorable"
-    "outperformed"
-    "underperformed"
-
-Use direct language:
-rose, fell, increased, decreased, remained, reversed,
-widened, narrowed, moved, recovered, declined.
-
-============================================================
-WHAT MAKES AN INSIGHT GOOD
-============================================================
-
-A strong point normally combines at least TWO useful facts when they
-are available.
-
-Examples:
-
-- current result + month-on-month movement
-- current result + budget position
-- month-on-month movement + multi-month trend
-- current result + YTD context
-- monthly result + contrasting YTD position
-- material driver + its recent historical pattern
-- latest month + peak/low/reversal information
-
-Do not create ten isolated single-number statements.
-
-Connect the facts intelligently while remaining factual.
-
-============================================================
-EXECUTIVE SUMMARY
-============================================================
-
-Return EXACTLY 2 points.
-
-These two points should explain the overall monthly cash-flow story.
-
-Use the headline KPIs.
-
-Do not list all six headline KPIs mechanically.
-
-Prioritise the metrics that best explain the selected month's position.
-
-Where useful, contrast two signals.
-
-For example:
-- FCF weakened while EBITDA improved.
-- Monthly performance declined while YTD remained above budget.
-
-Each executive point should normally be around 20-40 words.
-
-============================================================
-KEY MOVEMENTS
-============================================================
-
-Return EXACTLY 4 points.
-
-Four DRIVER facts are supplied, ranked 1 to 4.
-
-Create one useful point for EACH driver.
-
-Follow driver rank order.
-
-Do more than say:
-"X increased by Y."
-
-Where data supports it, add:
-- previous-month context,
-- budget position,
-- multi-month movement,
-- peak/low,
-- consecutive movement,
-- or relationship to the broader monthly picture.
-
-Do not claim a driver CAUSED a headline KPI unless causality is
-explicitly supplied. Use wording such as "alongside", "while", or
-"the largest underlying movement was" when appropriate.
-
-Each point should normally be around 18-40 words.
-
-============================================================
-TREND INSIGHT
-============================================================
-
-Return 1 or 2 points.
-
-Use actual historical months and the supplied trend classification.
-
-Look for meaningful patterns such as:
-- consistent increase,
-- consistent decrease,
-- reversal,
-- peak,
-- low,
-- consecutive increases/decreases,
-- movement from the first available month.
-
-Do not call something a trend if there is insufficient history.
-
-For the first available month, it is acceptable to return only one
-trend point explaining that an intra-year trend is not yet established.
-
-Do not repeat the Executive Summary.
-
-============================================================
-BUDGET & YTD
-============================================================
-
-Return 1 or 2 points.
-
-This section should answer:
-"What does the current month look like against plan, and does the
-cumulative YTD position tell the same story?"
-
-Prioritise differences between:
-- monthly vs budget
-- YTD vs budget
-- monthly direction vs cumulative direction
-
-This section should add interpretation, not repeat earlier sentences.
-
-============================================================
-STYLE
-============================================================
-
-Write for a senior finance/dashboard audience.
-
-Be concise, clear, factual and numerically specific.
-
-Do not use headings inside the individual points.
-
-Do not use bullet symbols inside the strings.
-
-Do not use Markdown.
-
-Do not begin every point with the same metric name.
-
-Return only the JSON structure requested by the schema.
-"""
-
-
-# ============================================================
-# WORDING WE DO NOT WANT
-# ============================================================
-
-BANNED_PHRASES = [
-    "due to",
-    "caused by",
-    "driven by",
-    "because of",
-    "resulting from",
-    "seasonality",
-    "seasonal",
-    "helping absorb",
-    "supported by",
-    "favorable",
-    "favourable",
-    "unfavorable",
-    "unfavourable",
-    "outperformed",
-    "underperformed",
+    "budget_ytd_point_1",
+    "budget_ytd_point_2",
 ]
 
 
 # ============================================================
-# GENERIC HELPERS
+# GOOGLE GENAI CLIENT
+# ============================================================
+
+def create_client():
+
+    return genai.Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location=VERTEX_LOCATION,
+    )
+
+
+# ============================================================
+# UTILITIES
 # ============================================================
 
 def is_missing(value):
 
-    if value is None:
-        return True
-
     try:
-        return bool(
-            pd.isna(value)
-        )
+        return pd.isna(value)
 
     except Exception:
-        return False
+        return value is None
+
+
+def clean_string(value):
+
+    if value is None:
+        return ""
+
+    if is_missing(value):
+        return ""
+
+    return str(value).strip()
 
 
 def safe_float(value):
+
+    if value is None:
+        return None
 
     if is_missing(value):
         return None
@@ -351,210 +240,70 @@ def safe_float(value):
         return None
 
 
-def safe_int(value):
+# ============================================================
+# CONVERT CASH VALUES TO MILLIONS
+#
+# The raw CF table contains full currency values.
+#
+# Example:
+# 638,876,900
+#
+# becomes:
+# 638.88
+#
+# Gemini is explicitly told that these numbers are millions
+# of the selected currency.
+# ============================================================
 
-    if is_missing(value):
+def to_millions(value):
+
+    value = safe_float(
+        value
+    )
+
+    if value is None:
         return None
 
-    try:
-        return int(float(value))
+    return round(
+        value / 1_000_000,
+        2,
+    )
 
-    except Exception:
+
+def rounded_pct(value):
+
+    value = safe_float(
+        value
+    )
+
+    if value is None:
         return None
 
+    if abs(value) > MAX_DISPLAY_MOM_PCT:
+        return None
 
-def clean_string(value):
+    return round(
+        value,
+        2,
+    )
 
-    if is_missing(value):
-        return ""
 
-    return str(value).strip()
+def rounded_rank(value):
+
+    value = safe_float(
+        value
+    )
+
+    if value is None:
+        return None
+
+    return int(
+        round(value)
+    )
 
 
 # ============================================================
-# NUMBER FORMATTING
-#
-# We format the financial numbers BEFORE Gemini.
-#
-# Gemini therefore does not need to decide:
-# 638876900 = 638.88m
-#
-# Python does it.
-# ============================================================
-
-def compact_number(value):
-
-    value = safe_float(
-        value
-    )
-
-    if value is None:
-        return None
-
-
-    absolute = abs(value)
-
-
-    if absolute >= 1_000_000_000:
-
-        scaled = (
-            absolute
-            /
-            1_000_000_000
-        )
-
-        suffix = "bn"
-
-
-    elif absolute >= 1_000_000:
-
-        scaled = (
-            absolute
-            /
-            1_000_000
-        )
-
-        suffix = "m"
-
-
-    elif absolute >= 1_000:
-
-        scaled = (
-            absolute
-            /
-            1_000
-        )
-
-        suffix = "k"
-
-
-    else:
-
-        scaled = absolute
-
-        suffix = ""
-
-
-    text = (
-        f"{scaled:.2f}"
-        .rstrip("0")
-        .rstrip(".")
-    )
-
-
-    return (
-        text
-        +
-        suffix
-    )
-
-
-def format_amount(
-    value,
-    currency,
-):
-
-    value = safe_float(
-        value
-    )
-
-    if value is None:
-        return None
-
-
-    number = compact_number(
-        value
-    )
-
-
-    negative = (
-        value < 0
-    )
-
-
-    if currency == "EUR":
-
-        if negative:
-            return f"-€{number}"
-
-        return f"€{number}"
-
-
-    # Local Currency.
-    # We deliberately do NOT guess GBP/ZAR/etc.
-    if negative:
-        return f"-LC {number}"
-
-    return f"LC {number}"
-
-
-def format_absolute_amount(
-    value,
-    currency,
-):
-
-    value = safe_float(
-        value
-    )
-
-    if value is None:
-        return None
-
-    return format_amount(
-        abs(value),
-        currency,
-    )
-
-
-def format_pct(
-    value,
-):
-
-    value = safe_float(
-        value
-    )
-
-    if value is None:
-        return None
-
-
-    text = (
-        f"{abs(value):.2f}"
-        .rstrip("0")
-        .rstrip(".")
-    )
-
-
-    if value < 0:
-        return f"-{text}%"
-
-    return f"{text}%"
-
-
-def format_absolute_pct(
-    value,
-):
-
-    value = safe_float(
-        value
-    )
-
-    if value is None:
-        return None
-
-
-    text = (
-        f"{abs(value):.2f}"
-        .rstrip("0")
-        .rstrip(".")
-    )
-
-
-    return f"{text}%"
-
-
-# ============================================================
-# LOAD INPUTS
+# READ INPUTS
 # ============================================================
 
 def load_inputs():
@@ -594,10 +343,11 @@ def load_inputs():
 
 
     string_columns = [
-        "Selected_Month",
+
         "Entity_CD",
         "Entity_Name",
         "Currency",
+        "Selected_Month",
         "Section",
         "Metric",
         "Account_CD",
@@ -618,10 +368,11 @@ def load_inputs():
 
 
     trend_string_columns = [
-        "Selected_Month",
+
         "Entity_CD",
         "Entity_Name",
         "Currency",
+        "Selected_Month",
         "Metric_Type",
         "Metric",
         "Account_CD",
@@ -649,133 +400,12 @@ def load_inputs():
 
 
 # ============================================================
-# BUILD ONE FACT OBJECT
+# BUILD CURRENT FACT
 # ============================================================
 
-def build_fact(
-    row,
-):
+def build_current_fact(row):
 
-    currency = clean_string(
-        row.get(
-            "Currency"
-        )
-    )
-
-
-    actual = safe_float(
-        row.get(
-            "Actual"
-        )
-    )
-
-
-    previous_actual = safe_float(
-        row.get(
-            "Previous_Actual"
-        )
-    )
-
-
-    mom_change = safe_float(
-        row.get(
-            "MoM_Change"
-        )
-    )
-
-
-    mom_pct = safe_float(
-        row.get(
-            "MoM_Pct_Safe"
-        )
-    )
-
-
-    budget = safe_float(
-        row.get(
-            "Budget"
-        )
-    )
-
-
-    vs_budget = safe_float(
-        row.get(
-            "Vs_Budget"
-        )
-    )
-
-
-    yoy = safe_float(
-        row.get(
-            "YoY_Abs"
-        )
-    )
-
-
-    ytd_actual = safe_float(
-        row.get(
-            "YTD_Actual"
-        )
-    )
-
-
-    ytd_budget = safe_float(
-        row.get(
-            "YTD_Budget"
-        )
-    )
-
-
-    ytd_vs_budget = safe_float(
-        row.get(
-            "YTD_Vs_Budget"
-        )
-    )
-
-
-    ytd_yoy = safe_float(
-        row.get(
-            "YTD_YoY_Abs"
-        )
-    )
-
-
-    first_actual = safe_float(
-        row.get(
-            "First_Actual"
-        )
-    )
-
-
-    change_from_first = safe_float(
-        row.get(
-            "Change_From_First"
-        )
-    )
-
-
-    change_from_first_pct = safe_float(
-        row.get(
-            "Change_From_First_Pct"
-        )
-    )
-
-
-    peak_actual = safe_float(
-        row.get(
-            "Peak_Actual"
-        )
-    )
-
-
-    lowest_actual = safe_float(
-        row.get(
-            "Lowest_Actual"
-        )
-    )
-
-
-    return {
+    fact = {
 
         "section":
             clean_string(
@@ -785,7 +415,7 @@ def build_fact(
             ),
 
         "rank":
-            safe_int(
+            rounded_rank(
                 row.get(
                     "Rank"
                 )
@@ -798,433 +428,378 @@ def build_fact(
                 )
             ),
 
-        "account_cd":
-            clean_string(
-                row.get(
-                    "Account_CD"
-                )
-            ),
-
-        "account_name":
+        "account":
             clean_string(
                 row.get(
                     "Account_Name"
                 )
             ),
 
-
-        # ====================================================
+        # ==============================================
         # CURRENT MONTH
-        # ====================================================
+        # ==============================================
 
-        "current": {
+        "actual_m":
+            to_millions(
+                row.get(
+                    "Actual"
+                )
+            ),
 
-            "actual_raw":
-                actual,
+        "previous_month":
+            clean_string(
+                row.get(
+                    "Previous_Month"
+                )
+            ),
 
-            "actual_display":
-                format_amount(
-                    actual,
-                    currency,
-                ),
-        },
+        "previous_actual_m":
+            to_millions(
+                row.get(
+                    "Previous_Actual"
+                )
+            ),
 
+        "mom_change_m":
+            to_millions(
+                row.get(
+                    "MoM_Change"
+                )
+            ),
 
-        # ====================================================
-        # MONTH ON MONTH
-        # ====================================================
+        "mom_pct":
+            rounded_pct(
+                row.get(
+                    "MoM_Pct_Safe"
+                )
+            ),
 
-        "month_on_month": {
+        "mom_direction":
+            clean_string(
+                row.get(
+                    "MoM_Direction"
+                )
+            ),
 
-            "previous_month":
-                clean_string(
-                    row.get(
-                        "Previous_Month"
-                    )
-                ),
+        # ==============================================
+        # BUDGET
+        # ==============================================
 
-            "previous_actual_raw":
-                previous_actual,
+        "budget_m":
+            to_millions(
+                row.get(
+                    "Budget"
+                )
+            ),
 
-            "previous_actual_display":
-                format_amount(
-                    previous_actual,
-                    currency,
-                ),
+        "vs_budget_m":
+            to_millions(
+                row.get(
+                    "Vs_Budget"
+                )
+            ),
 
-            "change_raw":
-                mom_change,
+        "budget_position":
+            clean_string(
+                row.get(
+                    "Budget_Position"
+                )
+            ),
 
-            "change_display":
-                format_amount(
-                    mom_change,
-                    currency,
-                ),
-
-            "change_absolute_display":
-                format_absolute_amount(
-                    mom_change,
-                    currency,
-                ),
-
-            "pct_raw":
-                mom_pct,
-
-            "pct_display":
-                format_pct(
-                    mom_pct
-                ),
-
-            "pct_absolute_display":
-                format_absolute_pct(
-                    mom_pct
-                ),
-
-            "direction":
-                clean_string(
-                    row.get(
-                        "MoM_Direction"
-                    )
-                ),
-        },
-
-
-        # ====================================================
-        # MONTHLY BUDGET
-        # ====================================================
-
-        "monthly_budget": {
-
-            "budget_raw":
-                budget,
-
-            "budget_display":
-                format_amount(
-                    budget,
-                    currency,
-                ),
-
-            "variance_raw":
-                vs_budget,
-
-            "variance_display":
-                format_amount(
-                    vs_budget,
-                    currency,
-                ),
-
-            "variance_absolute_display":
-                format_absolute_amount(
-                    vs_budget,
-                    currency,
-                ),
-
-            "position":
-                clean_string(
-                    row.get(
-                        "Budget_Position"
-                    )
-                ),
-        },
-
-
-        # ====================================================
+        # ==============================================
         # YOY
-        # ====================================================
+        # ==============================================
 
-        "year_on_year": {
+        "yoy_change_m":
+            to_millions(
+                row.get(
+                    "YoY_Abs"
+                )
+            ),
 
-            "absolute_change_raw":
-                yoy,
-
-            "absolute_change_display":
-                format_amount(
-                    yoy,
-                    currency,
-                ),
-
-            "absolute_magnitude_display":
-                format_absolute_amount(
-                    yoy,
-                    currency,
-                ),
-        },
-
-
-        # ====================================================
+        # ==============================================
         # YTD
-        # ====================================================
+        # ==============================================
 
-        "ytd": {
+        "ytd_actual_m":
+            to_millions(
+                row.get(
+                    "YTD_Actual"
+                )
+            ),
 
-            "actual_raw":
-                ytd_actual,
+        "ytd_budget_m":
+            to_millions(
+                row.get(
+                    "YTD_Budget"
+                )
+            ),
 
-            "actual_display":
-                format_amount(
-                    ytd_actual,
-                    currency,
-                ),
+        "ytd_vs_budget_m":
+            to_millions(
+                row.get(
+                    "YTD_Vs_Budget"
+                )
+            ),
 
-            "budget_raw":
-                ytd_budget,
+        "ytd_budget_position":
+            clean_string(
+                row.get(
+                    "YTD_Budget_Position"
+                )
+            ),
 
-            "budget_display":
-                format_amount(
-                    ytd_budget,
-                    currency,
-                ),
+        "ytd_yoy_change_m":
+            to_millions(
+                row.get(
+                    "YTD_YoY_Abs"
+                )
+            ),
 
-            "variance_raw":
-                ytd_vs_budget,
+        # ==============================================
+        # MULTI-MONTH ANALYSIS
+        # ==============================================
 
-            "variance_display":
-                format_amount(
-                    ytd_vs_budget,
-                    currency,
-                ),
+        "two_months_ago_actual_m":
+            to_millions(
+                row.get(
+                    "Two_Months_Ago_Actual"
+                )
+            ),
 
-            "variance_absolute_display":
-                format_absolute_amount(
-                    ytd_vs_budget,
-                    currency,
-                ),
+        "two_month_change_m":
+            to_millions(
+                row.get(
+                    "Two_Month_Change"
+                )
+            ),
 
-            "budget_position":
-                clean_string(
-                    row.get(
-                        "YTD_Budget_Position"
-                    )
-                ),
+        "three_months_ago_actual_m":
+            to_millions(
+                row.get(
+                    "Three_Months_Ago_Actual"
+                )
+            ),
 
-            "yoy_absolute_raw":
-                ytd_yoy,
+        "three_month_change_m":
+            to_millions(
+                row.get(
+                    "Three_Month_Change"
+                )
+            ),
 
-            "yoy_absolute_display":
-                format_amount(
-                    ytd_yoy,
-                    currency,
-                ),
-        },
+        # ==============================================
+        # TREND CONTEXT
+        # ==============================================
+
+        "history_months":
+            rounded_rank(
+                row.get(
+                    "History_Months"
+                )
+            ),
+
+        "first_month":
+            clean_string(
+                row.get(
+                    "First_Month"
+                )
+            ),
+
+        "first_actual_m":
+            to_millions(
+                row.get(
+                    "First_Actual"
+                )
+            ),
+
+        "change_from_first_m":
+            to_millions(
+                row.get(
+                    "Change_From_First"
+                )
+            ),
+
+        "change_from_first_pct":
+            rounded_pct(
+                row.get(
+                    "Change_From_First_Pct"
+                )
+            ),
+
+        "peak_month":
+            clean_string(
+                row.get(
+                    "Peak_Month"
+                )
+            ),
+
+        "peak_actual_m":
+            to_millions(
+                row.get(
+                    "Peak_Actual"
+                )
+            ),
+
+        "lowest_month":
+            clean_string(
+                row.get(
+                    "Lowest_Month"
+                )
+            ),
+
+        "lowest_actual_m":
+            to_millions(
+                row.get(
+                    "Lowest_Actual"
+                )
+            ),
+
+        "recent_trend":
+            clean_string(
+                row.get(
+                    "Recent_Trend"
+                )
+            ),
+
+        "consecutive_direction":
+            clean_string(
+                row.get(
+                    "Consecutive_Direction"
+                )
+            ),
+
+        "consecutive_count":
+            rounded_rank(
+                row.get(
+                    "Consecutive_Count"
+                )
+            ),
+
+        # ==============================================
+        # IMPORTANCE
+        # ==============================================
+
+        "materiality_rank":
+            rounded_rank(
+                row.get(
+                    "Materiality_Rank"
+                )
+            ),
+
+        "movement_rank":
+            rounded_rank(
+                row.get(
+                    "Movement_Rank"
+                )
+            ),
+
+        "budget_variance_rank":
+            rounded_rank(
+                row.get(
+                    "Budget_Variance_Rank"
+                )
+            ),
+    }
 
 
-        # ====================================================
-        # MULTI-MONTH HISTORY CONTEXT
-        # ====================================================
+    # Remove only None values.
+    #
+    # Keep zero because zero is meaningful financial data.
 
-        "history_context": {
-
-            "history_months":
-                safe_int(
-                    row.get(
-                        "History_Months"
-                    )
-                ),
-
-            "first_month":
-                clean_string(
-                    row.get(
-                        "First_Month"
-                    )
-                ),
-
-            "first_actual_display":
-                format_amount(
-                    first_actual,
-                    currency,
-                ),
-
-            "change_from_first_display":
-                format_amount(
-                    change_from_first,
-                    currency,
-                ),
-
-            "change_from_first_pct":
-                format_pct(
-                    change_from_first_pct
-                ),
-
-            "peak_month":
-                clean_string(
-                    row.get(
-                        "Peak_Month"
-                    )
-                ),
-
-            "peak_actual_display":
-                format_amount(
-                    peak_actual,
-                    currency,
-                ),
-
-            "lowest_month":
-                clean_string(
-                    row.get(
-                        "Lowest_Month"
-                    )
-                ),
-
-            "lowest_actual_display":
-                format_amount(
-                    lowest_actual,
-                    currency,
-                ),
-
-            "recent_trend":
-                clean_string(
-                    row.get(
-                        "Recent_Trend"
-                    )
-                ),
-
-            "consecutive_direction":
-                clean_string(
-                    row.get(
-                        "Consecutive_Direction"
-                    )
-                ),
-
-            "consecutive_count":
-                safe_int(
-                    row.get(
-                        "Consecutive_Count"
-                    )
-                ),
-        },
-
-
-        # ====================================================
-        # RANKINGS
-        # ====================================================
-
-        "importance": {
-
-            "materiality_rank":
-                safe_int(
-                    row.get(
-                        "Materiality_Rank"
-                    )
-                ),
-
-            "movement_rank":
-                safe_int(
-                    row.get(
-                        "Movement_Rank"
-                    )
-                ),
-
-            "budget_variance_rank":
-                safe_int(
-                    row.get(
-                        "Budget_Variance_Rank"
-                    )
-                ),
-        },
+    return {
+        key: value
+        for key, value in fact.items()
+        if value is not None
     }
 
 
 # ============================================================
-# TREND HISTORY FOR ONE ACCOUNT
+# BUILD TREND FACTS
 # ============================================================
 
-def build_monthly_history(
+def build_trend_facts(
     trend_subset,
-    account_cd,
-    currency,
 ):
-
-    history = (
-        trend_subset[
-            trend_subset[
-                "Account_CD"
-            ]
-            ==
-            account_cd
-        ]
-        .sort_values(
-            "Trend_Month_Order"
-        )
-    )
-
 
     output = []
 
 
-    for _, row in history.iterrows():
+    grouped = trend_subset.groupby(
+        [
+            "Account_CD",
+            "Metric",
+            "Metric_Type",
+        ],
+        dropna=False,
+    )
+
+
+    for (
+        account_cd,
+        metric,
+        metric_type,
+    ), group in grouped:
+
+        group = group.sort_values(
+            "Trend_Month_Order"
+        )
+
+
+        monthly_history = []
+
+
+        for _, row in group.iterrows():
+
+            monthly_history.append(
+                {
+
+                    "month":
+                        clean_string(
+                            row.get(
+                                "Trend_Month"
+                            )
+                        ),
+
+                    "actual_m":
+                        to_millions(
+                            row.get(
+                                "Actual"
+                            )
+                        ),
+
+                    "budget_m":
+                        to_millions(
+                            row.get(
+                                "Budget"
+                            )
+                        ),
+
+                    "vs_budget_m":
+                        to_millions(
+                            row.get(
+                                "Vs_Budget"
+                            )
+                        ),
+                }
+            )
+
 
         output.append(
             {
 
-                "month":
+                "metric_type":
                     clean_string(
-                        row.get(
-                            "Trend_Month"
-                        )
+                        metric_type
                     ),
 
-                "month_order":
-                    safe_int(
-                        row.get(
-                            "Trend_Month_Order"
-                        )
+                "metric":
+                    clean_string(
+                        metric
                     ),
 
-                "actual":
-                    format_amount(
-                        row.get(
-                            "Actual"
-                        ),
-                        currency,
-                    ),
-
-                "budget":
-                    format_amount(
-                        row.get(
-                            "Budget"
-                        ),
-                        currency,
-                    ),
-
-                "vs_budget":
-                    format_amount(
-                        row.get(
-                            "Vs_Budget"
-                        ),
-                        currency,
-                    ),
-
-                "yoy_absolute":
-                    format_amount(
-                        row.get(
-                            "YoY_Abs"
-                        ),
-                        currency,
-                    ),
-
-                "ytd_actual":
-                    format_amount(
-                        row.get(
-                            "YTD_Actual"
-                        ),
-                        currency,
-                    ),
-
-                "ytd_budget":
-                    format_amount(
-                        row.get(
-                            "YTD_Budget"
-                        ),
-                        currency,
-                    ),
-
-                "ytd_vs_budget":
-                    format_amount(
-                        row.get(
-                            "YTD_Vs_Budget"
-                        ),
-                        currency,
-                    ),
+                "history":
+                    monthly_history,
             }
         )
 
@@ -1233,7 +808,7 @@ def build_monthly_history(
 
 
 # ============================================================
-# BUILD COMPLETE GEMINI FACT PACKAGE
+# BUILD COMPLETE FACT PACKAGE
 # ============================================================
 
 def build_fact_package(
@@ -1241,141 +816,90 @@ def build_fact_package(
     trend_subset,
 ):
 
-    insight_subset = (
-        insight_subset
-        .sort_values(
-            [
-                "Section",
-                "Rank",
-            ]
-        )
-        .copy()
-    )
-
-
     first = insight_subset.iloc[0]
 
 
-    currency = clean_string(
-        first[
-            "Currency"
-        ]
-    )
-
-
-    headline_facts = []
-
-    driver_facts = []
-
-
-    for _, row in insight_subset.iterrows():
-
-        fact = build_fact(
-            row
-        )
-
-
-        account_cd = clean_string(
-            row[
-                "Account_CD"
-            ]
-        )
-
-
-        fact[
-            "monthly_history"
-        ] = build_monthly_history(
-
-            trend_subset=
-
-                trend_subset,
-
-            account_cd=
-
-                account_cd,
-
-            currency=
-
-                currency,
-        )
-
-
-        if (
-            row[
+    headline_df = (
+        insight_subset[
+            insight_subset[
                 "Section"
             ]
             ==
             "HEADLINE"
-        ):
+        ]
+        .sort_values(
+            "Rank"
+        )
+    )
 
-            headline_facts.append(
-                fact
-            )
 
-
-        elif (
-            row[
+    driver_df = (
+        insight_subset[
+            insight_subset[
                 "Section"
             ]
             ==
             "DRIVER"
-        ):
-
-            driver_facts.append(
-                fact
-            )
-
-
-    headline_facts = sorted(
-        headline_facts,
-        key=lambda x:
-            x[
-                "rank"
-            ]
-            if x[
-                "rank"
-            ]
-            is not None
-            else 999,
+        ]
+        .sort_values(
+            "Rank"
+        )
     )
 
 
-    driver_facts = sorted(
-        driver_facts,
-        key=lambda x:
-            x[
-                "rank"
-            ]
-            if x[
-                "rank"
-            ]
-            is not None
-            else 999,
+    headline_facts = [
+
+        build_current_fact(
+            row
+        )
+
+        for _, row in (
+            headline_df.iterrows()
+        )
+    ]
+
+
+    driver_facts = [
+
+        build_current_fact(
+            row
+        )
+
+        for _, row in (
+            driver_df.iterrows()
+        )
+    ]
+
+
+    trend_facts = (
+        build_trend_facts(
+            trend_subset
+        )
     )
 
 
-    return {
+    package = {
 
         "context": {
 
             "fiscal_year":
-                safe_int(
+                int(
                     first[
                         "Fiscal_Year"
                     ]
                 ),
 
-            "selected_month":
+            "month":
                 clean_string(
                     first[
                         "Selected_Month"
                     ]
                 ),
 
-            "selected_month_order":
-                safe_int(
+            "entity":
+                clean_string(
                     first[
-                        "Selected_Month_Order"
+                        "Entity_Name"
                     ]
                 ),
 
@@ -1386,32 +910,32 @@ def build_fact_package(
                     ]
                 ),
 
-            "entity_name":
+            "currency":
                 clean_string(
                     first[
-                        "Entity_Name"
+                        "Currency"
                     ]
                 ),
 
-            "currency":
-                currency,
-
-            "currency_display_rule":
+            "amount_unit":
                 (
-                    "Use € for supplied EUR values."
-                    if currency == "EUR"
-                    else
-                    "Use LC exactly as supplied. "
-                    "Do not guess the local currency."
+                    "millions of the selected "
+                    "currency"
                 ),
         },
 
         "headline_kpis":
             headline_facts,
 
-        "top_4_drivers":
+        "top_4_material_drivers":
             driver_facts,
+
+        "historical_monthly_values":
+            trend_facts,
     }
+
+
+    return package
 
 
 # ============================================================
@@ -1420,338 +944,506 @@ def build_fact_package(
 
 def build_prompt(
     fact_package,
-    previous_issues=None,
+    retry_note="",
 ):
 
+    context = fact_package[
+        "context"
+    ]
+
+
+    currency = context[
+        "currency"
+    ]
+
+
+    retry_section = ""
+
+
+    if retry_note:
+
+        retry_section = f"""
+
+PREVIOUS ATTEMPT ISSUE
+----------------------
+{retry_note}
+
+Correct that issue in this attempt.
+"""
+
+
     prompt = f"""
-Analyse the following structured Cash Flow facts and create the
-Iteration-2 popup commentary.
+You are an executive cash-flow analyst.
 
-The output must follow these section counts:
+You are writing AI commentary for an SAP Analytics Cloud
+cash-flow dashboard.
 
-EXECUTIVE SUMMARY:
-- exactly 2 points
+Selected context:
 
-KEY MOVEMENTS:
-- exactly 4 points
-- one point per supplied driver
-- follow driver rank 1, 2, 3, 4
+Fiscal Year: {context['fiscal_year']}
+Month: {context['month']}
+Entity: {context['entity']}
+Currency: {currency}
 
-TREND INSIGHT:
-- 1 or 2 points
+All monetary numbers supplied below are already expressed in
+MILLIONS of the selected currency.
 
-BUDGET & YTD:
-- 1 or 2 points
+For EUR:
+write monetary amounts as "EUR 25.4m".
 
-The purpose of this popup is that a finance user should be able to
-open it and understand the selected month's financial story without
-having to interpret every dashboard number manually.
+For LC:
+write monetary amounts as "LC 25.4m".
 
-Do NOT merely repeat values.
+Do not convert between currencies.
 
-Use the supplied comparisons and historical context to determine:
-- what changed materially,
-- whether the movement continued or reversed,
-- how the result sits against budget,
-- whether the YTD picture differs from the monthly result,
-- and which underlying movements deserve attention.
 
-IMPORTANT:
-`raw` values exist only for factual grounding.
-When quoting amounts, use the corresponding `display` values.
+============================================================
+OBJECTIVE
+============================================================
 
-Here are the facts:
+Create concise but genuinely insightful executive commentary.
+
+A reader opening the popup should understand:
+
+1. What materially happened in the selected month.
+2. Which headline KPIs changed the most or matter most.
+3. Which underlying supplied drivers were significant.
+4. Whether the latest month continues or reverses a trend.
+5. How performance compares with monthly budget.
+6. How the year-to-date position compares with budget.
+7. Relevant YoY context where supplied.
+
+
+============================================================
+VERY IMPORTANT WRITING STANDARD
+============================================================
+
+Do NOT merely restate one number per sentence.
+
+Weak:
+"EBITDA decreased by 3.6%."
+
+Better:
+"EBITDA declined 3.6% MoM to EUR 113.7m, extending the recent
+downward direction while remaining EUR 8.2m below budget."
+
+The better sentence combines multiple supported facts.
+
+Look for meaningful relationships across the supplied facts.
+
+Examples of useful relationships:
+
+- current month versus previous month
+- current value versus budget
+- YTD value versus YTD budget
+- current month versus available FY history
+- reversal after previous increases/decreases
+- consecutive monthly movements
+- latest value being the highest or lowest in available history
+- headline movement occurring alongside a material component movement
+- divergence between two headline KPIs
+- strongest material driver among the supplied drivers
+
+However, correlation is NOT causation.
+
+You may say:
+
+"Working Capital declined while WC Receivables also moved lower."
+
+Do NOT say:
+
+"WC Receivables caused the Working Capital decline"
+
+unless that causal relationship is explicitly established by the
+supplied data.
+
+
+============================================================
+SECTION REQUIREMENTS
+============================================================
+
+EXECUTIVE POINTS — 2
+
+These are the two most important takeaways.
+
+Each executive point should usually combine 2 or more relevant facts.
+
+Do not repeat the same fact in both points.
+
+
+KEY MOVEMENTS — 4
+
+Use the supplied Top 4 material drivers and/or important headline
+movements.
+
+Explain why each movement stands out numerically.
+
+Use comparisons such as MoM, budget, ranking, or historical position
+when available.
+
+Avoid four repetitive sentences with identical structure.
+
+
+TREND POINTS — 2
+
+Describe meaningful multi-month patterns.
+
+Use facts such as:
+
+CONSISTENT_INCREASE
+CONSISTENT_DECREASE
+REVERSAL_UP
+REVERSAL_DOWN
+MIXED
+
+Also use peak/low month and consecutive movements where useful.
+
+If this is the first available month and a trend cannot be established,
+state that clearly rather than inventing a trend.
+
+Do not predict future performance.
+
+
+BUDGET & YTD POINTS — 2
+
+Focus on:
+
+monthly budget position
++
+year-to-date budget position
+
+Where useful, contrast monthly performance with cumulative YTD
+performance.
+
+Example:
+
+"Although September FCF finished above monthly budget, YTD FCF
+remains below plan."
+
+Only make such a statement if the supplied facts support it.
+
+
+============================================================
+STRICT FACTUAL RULES
+============================================================
+
+Use ONLY the supplied data.
+
+Never invent:
+
+- causes
+- operational explanations
+- management actions
+- forecasts
+- missing numbers
+- business events
+
+Do not call a movement favourable, unfavourable, strong, weak,
+healthy, poor, or concerning solely because the number increased
+or decreased.
+
+For example, a more negative cash-flow line is not automatically
+bad unless the supplied business context proves that interpretation.
+
+Use neutral language when business meaning is uncertain:
+
+- increased
+- decreased
+- moved higher
+- moved lower
+- above budget
+- below budget
+- reversed
+- remained stable
+- widened
+- narrowed
+
+
+============================================================
+NUMERIC RULES
+============================================================
+
+Round monetary values sensibly, normally to 1 or 2 decimals.
+
+Do not calculate a MoM percentage when "mom_pct" is absent.
+
+When a supplied percentage is absent because the prior-period base
+was near zero, describe the absolute movement instead.
+
+Do not invent percentages from the raw values.
+
+Do not mix EUR and LC.
+
+All facts in this request belong only to:
+{context['entity']} | {context['month']} | {currency}
+
+
+============================================================
+ANTI-REPETITION RULE
+============================================================
+
+Each of the 10 points must add new information.
+
+A number may appear again only when needed to connect a different
+insight.
+
+Do not repeat the exact same observation in Executive Summary,
+Key Movements, Trend, and Budget/YTD.
+
+
+============================================================
+FACT PACKAGE
+============================================================
 
 {json.dumps(
     fact_package,
     indent=2,
-    ensure_ascii=False
+    ensure_ascii=False,
+    allow_nan=False,
 )}
+{retry_section}
 """
 
 
-    if previous_issues:
-
-        prompt += f"""
-
-Your previous response had these quality/structure problems:
-
-{previous_issues}
-
-Correct those problems in this response.
-"""
-
-
-    return prompt
+    return prompt.strip()
 
 
 # ============================================================
-# LOCAL OUTPUT VALIDATION
+# PARSE GEMINI RESPONSE
 # ============================================================
 
-def normalize_point(
-    point,
+def parse_response(
+    response,
 ):
 
-    point = clean_string(
-        point
+    # ========================================================
+    # FIRST: SDK-parsed structured response
+    # ========================================================
+
+    parsed = getattr(
+        response,
+        "parsed",
+        None,
     )
 
 
-    # Remove Gemini-created bullet markers
-    point = re.sub(
-        r"^[•\-\*\s]+",
-        "",
-        point,
-    )
+    if parsed is not None:
 
-
-    # Collapse whitespace
-    point = re.sub(
-        r"\s+",
-        " ",
-        point,
-    )
-
-
-    return point.strip()
-
-
-def normalize_generated_output(
-    result,
-):
-
-    normalized = {}
-
-
-    for section in [
-        "executive_summary",
-        "key_movements",
-        "trend_insight",
-        "budget_ytd",
-    ]:
-
-        values = result.get(
-            section,
-            []
-        )
-
-
-        if not isinstance(
-            values,
-            list,
+        if isinstance(
+            parsed,
+            dict,
         ):
 
-            values = []
+            return parsed
 
 
-        normalized[
-            section
-        ] = [
+        if hasattr(
+            parsed,
+            "model_dump",
+        ):
 
-            normalize_point(
-                value
-            )
-
-            for value in values
-
-            if normalize_point(
-                value
-            )
-        ]
-
-
-    return normalized
-
-
-def validate_generated_output(
-    result,
-):
-
-    issues = []
+            return parsed.model_dump()
 
 
     # ========================================================
-    # STRUCTURE
+    # FALLBACK: response.text
     # ========================================================
 
-    if len(
-        result[
-            "executive_summary"
-        ]
-    ) != 2:
-
-        issues.append(
-            "Executive Summary must contain exactly 2 points."
+    text = clean_string(
+        getattr(
+            response,
+            "text",
+            ""
         )
-
-
-    if len(
-        result[
-            "key_movements"
-        ]
-    ) != 4:
-
-        issues.append(
-            "Key Movements must contain exactly 4 points."
-        )
-
-
-    if not (
-        1
-        <=
-        len(
-            result[
-                "trend_insight"
-            ]
-        )
-        <=
-        2
-    ):
-
-        issues.append(
-            "Trend Insight must contain 1 or 2 points."
-        )
-
-
-    if not (
-        1
-        <=
-        len(
-            result[
-                "budget_ytd"
-            ]
-        )
-        <=
-        2
-    ):
-
-        issues.append(
-            "Budget & YTD must contain 1 or 2 points."
-        )
-
-
-    # ========================================================
-    # DUPLICATE POINTS
-    # ========================================================
-
-    all_points = (
-        result[
-            "executive_summary"
-        ]
-        +
-        result[
-            "key_movements"
-        ]
-        +
-        result[
-            "trend_insight"
-        ]
-        +
-        result[
-            "budget_ytd"
-        ]
     )
 
 
-    normalized_points = [
-        re.sub(
-            r"[^a-z0-9]+",
-            " ",
-            point.lower(),
-        ).strip()
+    if not text:
 
-        for point in all_points
+        raise ValueError(
+            "Gemini returned empty response text."
+        )
+
+
+    # Defensive cleanup in case fences appear despite
+    # structured-output mode.
+
+    if text.startswith(
+        "```"
+    ):
+
+        text = text.strip("`")
+
+        if text.lower().startswith(
+            "json"
+        ):
+
+            text = text[4:].strip()
+
+
+    return json.loads(
+        text
+    )
+
+
+# ============================================================
+# VALIDATE STRUCTURED RESPONSE
+# ============================================================
+
+def validate_result(
+    result,
+    selected_month_order,
+):
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+
+        raise ValueError(
+            "Structured response is not a JSON object."
+        )
+
+
+    missing = [
+
+        field
+
+        for field in OUTPUT_FIELDS
+
+        if field not in result
     ]
 
 
-    if (
-        len(
-            normalized_points
-        )
-        !=
-        len(
-            set(
-                normalized_points
+    if missing:
+
+        raise ValueError(
+            "Missing output fields: "
+            +
+            ", ".join(
+                missing
             )
         )
-    ):
-
-        issues.append(
-            "Duplicate commentary points were produced."
-        )
 
 
-    # ========================================================
-    # BANNED / UNSUPPORTED WORDING
-    # ========================================================
-
-    joined_text = (
-        " "
-        .join(
-            all_points
-        )
-        .lower()
-    )
+    cleaned = {}
 
 
-    for phrase in BANNED_PHRASES:
+    for field in OUTPUT_FIELDS:
 
-        if phrase.lower() in joined_text:
-
-            issues.append(
-                f"Unsupported/vague wording detected: '{phrase}'."
+        value = clean_string(
+            result.get(
+                field
             )
+        )
+
+        cleaned[
+            field
+        ] = value
 
 
     # ========================================================
-    # VERY SHORT POINTS
+    # CORE POINTS MUST ALWAYS EXIST
+    # ========================================================
+
+    mandatory_non_empty = [
+
+        "executive_point_1",
+        "executive_point_2",
+
+        "key_movement_1",
+        "key_movement_2",
+        "key_movement_3",
+        "key_movement_4",
+
+        "budget_ytd_point_1",
+        "budget_ytd_point_2",
+    ]
+
+
+    empty_mandatory = [
+
+        field
+
+        for field in mandatory_non_empty
+
+        if not cleaned[
+            field
+        ]
+    ]
+
+
+    if empty_mandatory:
+
+        raise ValueError(
+            "Empty required commentary fields: "
+            +
+            ", ".join(
+                empty_mandatory
+            )
+        )
+
+
+    # ========================================================
+    # TREND
     #
-    # This stops us getting:
-    # "EBITDA increased 3.5%."
+    # From May onward, require both trend points.
+    #
+    # April is first available month, so one trend point can
+    # legitimately explain that history is insufficient.
     # ========================================================
 
-    for index, point in enumerate(
-        all_points,
-        start=1,
-    ):
+    if selected_month_order > 1:
 
-        word_count = len(
-            point.split()
-        )
+        if not cleaned[
+            "trend_point_1"
+        ]:
 
-
-        if word_count < 9:
-
-            issues.append(
-                f"Point {index} is too short to be insightful."
+            raise ValueError(
+                "Trend point 1 is empty."
             )
 
 
-        if word_count > 55:
+        if not cleaned[
+            "trend_point_2"
+        ]:
 
-            issues.append(
-                f"Point {index} is too long for the popup."
+            raise ValueError(
+                "Trend point 2 is empty."
             )
 
 
-    return issues
+    else:
+
+        if not cleaned[
+            "trend_point_1"
+        ]:
+
+            cleaned[
+                "trend_point_1"
+            ] = (
+                "This is the first available month in the "
+                "current fiscal-year history, so a monthly "
+                "trend cannot yet be established."
+            )
+
+
+    return cleaned
 
 
 # ============================================================
 # GENERATE ONE SUMMARY
 # ============================================================
 
-def generate_summary(
+def generate_one_summary(
     client,
     fact_package,
+    selected_month_order,
 ):
 
-    previous_issues = None
+    last_error = ""
 
-    last_result = None
-
-    last_issues = []
+    last_raw_text = ""
 
 
     for attempt in range(
@@ -1759,214 +1451,144 @@ def generate_summary(
         MAX_ATTEMPTS + 1,
     ):
 
-        prompt = build_prompt(
-            fact_package=
-                fact_package,
+        try:
 
-            previous_issues=
-                previous_issues,
-        )
+            prompt = build_prompt(
+                fact_package=fact_package,
+                retry_note=last_error,
+            )
 
 
-        response = (
-            client.models.generate_content(
+            response = (
+                client.models.generate_content(
 
-                model=
-                    GEMINI_MODEL,
+                    model=GEMINI_MODEL,
 
-                contents=
-                    prompt,
+                    contents=prompt,
 
-                config=
+                    config=
                     types.GenerateContentConfig(
-
-                        system_instruction=
-                            SYSTEM_INSTRUCTION,
-
-                        thinking_config=
-                            types.ThinkingConfig(
-                                thinking_level=
-                                    THINKING_LEVEL
-                            ),
 
                         response_mime_type=
                             "application/json",
 
-                        response_schema=
-                            RESPONSE_SCHEMA,
+                        response_json_schema=
+                            SUMMARY_SCHEMA,
 
-                        max_output_tokens=
-                            MAX_OUTPUT_TOKENS,
+                        thinking_config=
+                            types.ThinkingConfig(
+
+                                thinking_level=
+                                    types.ThinkingLevel.MEDIUM
+                            ),
                     ),
-            )
-        )
-
-
-        if not response.text:
-
-            previous_issues = (
-                "The model returned an empty response."
-            )
-
-            continue
-
-
-        try:
-
-            result = json.loads(
-                response.text
+                )
             )
 
 
-        except json.JSONDecodeError as error:
-
-            previous_issues = (
-                "The previous response was not valid JSON: "
-                f"{error}"
+            last_raw_text = clean_string(
+                getattr(
+                    response,
+                    "text",
+                    ""
+                )
             )
 
-            continue
+
+            result = parse_response(
+                response
+            )
 
 
-        result = normalize_generated_output(
-            result
-        )
+            result = validate_result(
+                result=result,
+                selected_month_order=
+                    selected_month_order,
+            )
 
-
-        issues = validate_generated_output(
-            result
-        )
-
-
-        last_result = result
-
-        last_issues = issues
-
-
-        if not issues:
 
             return (
                 result,
-                "PASS",
-                "",
                 attempt,
+                last_raw_text,
+                "",
             )
 
 
-        previous_issues = (
-            "\n".join(
-                f"- {issue}"
-                for issue in issues
+        except Exception as exc:
+
+            last_error = (
+                f"{type(exc).__name__}: "
+                f"{str(exc)}"
             )
-        )
 
 
-    # ========================================================
-    # If the third attempt is usable but has a softer quality
-    # warning, keep it for POC review instead of losing it.
-    # ========================================================
-
-    if last_result is not None:
-
-        return (
-            last_result,
-            "WARN",
-            " | ".join(
-                last_issues
-            ),
-            MAX_ATTEMPTS,
-        )
+            print(
+                f"      Attempt {attempt} failed: "
+                f"{last_error}"
+            )
 
 
-    raise RuntimeError(
-        "Gemini failed to return a usable structured response "
-        f"after {MAX_ATTEMPTS} attempts."
-    )
+            if attempt < MAX_ATTEMPTS:
 
-
-# ============================================================
-# POPUP COLUMNS
-# ============================================================
-
-def point_at(
-    points,
-    index,
-):
-
-    if index < len(points):
-        return points[index]
-
-    return ""
-
-
-def build_summary_full(
-    result,
-):
-
-    sections = []
-
-
-    sections.append(
-        "EXECUTIVE SUMMARY\n"
-        +
-        "\n".join(
-            f"• {point}"
-            for point in result[
-                "executive_summary"
-            ]
-        )
-    )
-
-
-    sections.append(
-        "KEY MOVEMENTS\n"
-        +
-        "\n".join(
-            f"• {point}"
-            for point in result[
-                "key_movements"
-            ]
-        )
-    )
-
-
-    sections.append(
-        "TREND INSIGHT\n"
-        +
-        "\n".join(
-            f"• {point}"
-            for point in result[
-                "trend_insight"
-            ]
-        )
-    )
-
-
-    sections.append(
-        "BUDGET & YTD\n"
-        +
-        "\n".join(
-            f"• {point}"
-            for point in result[
-                "budget_ytd"
-            ]
-        )
-    )
+                time.sleep(
+                    RETRY_SLEEP_SECONDS
+                )
 
 
     return (
-        "\n\n"
-        .join(
-            sections
-        )
+        None,
+        MAX_ATTEMPTS,
+        last_raw_text,
+        last_error,
     )
 
 
 # ============================================================
-# KEY
+# BUILD FULL SUMMARY
+#
+# Kept for easy validation and optional SAC use.
 # ============================================================
 
-def row_key(
+def build_full_summary(
+    result,
+):
+
+    return (
+        "EXECUTIVE SUMMARY\n"
+        f"• {result['executive_point_1']}\n"
+        f"• {result['executive_point_2']}\n\n"
+
+        "KEY MOVEMENTS\n"
+        f"• {result['key_movement_1']}\n"
+        f"• {result['key_movement_2']}\n"
+        f"• {result['key_movement_3']}\n"
+        f"• {result['key_movement_4']}\n\n"
+
+        "TREND INSIGHT\n"
+        f"• {result['trend_point_1']}\n"
+        f"• {result['trend_point_2']}\n\n"
+
+        "BUDGET & YTD\n"
+        f"• {result['budget_ytd_point_1']}\n"
+        f"• {result['budget_ytd_point_2']}"
+    )
+
+
+# ============================================================
+# OUTPUT KEY
+# ============================================================
+
+KEY_COLUMNS = [
+
+    "Fiscal_Year",
+    "Month",
+    "Entity_CD",
+    "Currency",
+]
+
+
+def make_key(
     fiscal_year,
     month,
     entity_cd,
@@ -1974,23 +1596,15 @@ def row_key(
 ):
 
     return (
-        safe_int(
-            fiscal_year
-        ),
-        clean_string(
-            month
-        ),
-        clean_string(
-            entity_cd
-        ),
-        clean_string(
-            currency
-        ),
+        int(fiscal_year),
+        clean_string(month),
+        clean_string(entity_cd),
+        clean_string(currency),
     )
 
 
 # ============================================================
-# EXISTING OUTPUT
+# LOAD EXISTING OUTPUT
 # ============================================================
 
 def load_existing_output():
@@ -2000,55 +1614,89 @@ def load_existing_output():
         return pd.DataFrame()
 
 
-    return pd.read_csv(
-        OUTPUT_FILE,
-        dtype={
-            "Entity_CD": str,
-        },
-    )
+    try:
+
+        return pd.read_csv(
+            OUTPUT_FILE,
+            dtype={
+                "Entity_CD": str,
+            },
+        )
+
+    except Exception:
+
+        return pd.DataFrame()
 
 
-def existing_keys(
+# ============================================================
+# REMOVE EXISTING KEY BEFORE REPLACEMENT
+# ============================================================
+
+def remove_existing_key(
     df,
+    key,
 ):
 
     if df.empty:
 
-        return set()
+        return df
 
 
-    keys = set()
+    fiscal_year, month, entity_cd, currency = key
 
 
-    for _, row in df.iterrows():
-
-        keys.add(
-            row_key(
-                row.get(
+    mask = ~(
+        (
+            pd.to_numeric(
+                df[
                     "Fiscal_Year"
-                ),
-                row.get(
-                    "Month"
-                ),
-                row.get(
-                    "Entity_CD"
-                ),
-                row.get(
-                    "Currency"
-                ),
+                ],
+                errors="coerce",
             )
+            ==
+            fiscal_year
         )
+        &
+        (
+            df[
+                "Month"
+            ].astype(str)
+            ==
+            month
+        )
+        &
+        (
+            df[
+                "Entity_CD"
+            ].astype(str)
+            ==
+            entity_cd
+        )
+        &
+        (
+            df[
+                "Currency"
+            ].astype(str)
+            ==
+            currency
+        )
+    )
 
 
-    return keys
+    return (
+        df[
+            mask
+        ]
+        .copy()
+    )
 
 
 # ============================================================
-# SAVE
+# SAVE OUTPUT
 # ============================================================
 
 def save_output(
-    output_df,
+    df,
 ):
 
     OUTPUT_FILE.parent.mkdir(
@@ -2057,30 +1705,32 @@ def save_output(
     )
 
 
-    if not output_df.empty:
-
-        output_df = (
-            output_df
-            .sort_values(
-                [
-                    "Fiscal_Year",
-                    "Month_Order",
-                    "Entity_Name",
-                    "Currency",
-                ]
-            )
-            .reset_index(
-                drop=True
-            )
+    df = (
+        df
+        .sort_values(
+            [
+                "Fiscal_Year",
+                "Month_Order",
+                "Entity_Name",
+                "Currency",
+            ]
         )
+        .reset_index(
+            drop=True
+        )
+    )
 
 
-    output_df.to_csv(
+    df.to_csv(
         OUTPUT_FILE,
         index=False,
         encoding="utf-8-sig",
     )
 
+
+# ============================================================
+# APPEND LOG
+# ============================================================
 
 def append_log(
     log_row,
@@ -2109,7 +1759,6 @@ def append_log(
             encoding="utf-8-sig",
         )
 
-
     else:
 
         log_df.to_csv(
@@ -2120,125 +1769,289 @@ def append_log(
 
 
 # ============================================================
-# ARGUMENTS
+# SAVE FAILED RAW RESPONSE
 # ============================================================
 
-def parse_args():
+def save_failed_response(
+    key,
+    raw_response,
+    error,
+):
 
-    parser = argparse.ArgumentParser()
-
-
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help=(
-            "Regenerate selected combinations even if "
-            "they already exist."
-        ),
+    RAW_FAILURE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
 
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help=(
-            "Generate only N combinations. "
-            "Useful for quality testing."
-        ),
+    fiscal_year, month, entity_cd, currency = key
+
+
+    safe_entity = (
+        entity_cd
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace(".", "_")
     )
 
 
-    parser.add_argument(
-        "--entity",
-        type=str,
-        default=None,
-        help=(
-            "Optional Entity_CD or exact Entity_Name filter."
-        ),
+    filename = (
+        f"{safe_entity}_"
+        f"{fiscal_year}_"
+        f"{month}_"
+        f"{currency}.txt"
     )
 
 
-    parser.add_argument(
-        "--month",
-        type=str,
-        default=None,
-        help=(
-            "Optional month filter, e.g. Sep."
-        ),
+    path = (
+        RAW_FAILURE_DIR
+        /
+        filename
     )
 
 
-    parser.add_argument(
-        "--currency",
-        type=str,
-        choices=[
-            "EUR",
-            "LC",
-        ],
-        default=None,
+    content = (
+        f"ERROR\n"
+        f"=====\n"
+        f"{error}\n\n"
+        f"RAW GEMINI RESPONSE\n"
+        f"===================\n"
+        f"{raw_response}"
     )
 
 
-    return parser.parse_args()
+    path.write_text(
+        content,
+        encoding="utf-8",
+    )
 
 
 # ============================================================
-# MAIN
+# BUILD FINAL OUTPUT ROW
 # ============================================================
 
-def main():
+def build_output_row(
+    first_row,
+    result,
+    attempts,
+):
 
-    args = parse_args()
+    generated_at = (
+        datetime.now(
+            timezone.utc
+        )
+        .isoformat()
+    )
 
 
-    print()
-    print("=" * 90)
-    print("CASHFLOW AI - ITERATION 2")
-    print("RICH POPUP COMMENTARY GENERATOR")
-    print("=" * 90)
+    full_summary = (
+        build_full_summary(
+            result
+        )
+    )
 
 
-    # ========================================================
-    # INPUT
-    # ========================================================
+    return {
 
-    insight_df, trend_df = (
-        load_inputs()
+        "Fiscal_Year":
+            int(
+                first_row[
+                    "Fiscal_Year"
+                ]
+            ),
+
+        "Month":
+            clean_string(
+                first_row[
+                    "Selected_Month"
+                ]
+            ),
+
+        "Month_Order":
+            int(
+                first_row[
+                    "Selected_Month_Order"
+                ]
+            ),
+
+        "Entity_CD":
+            clean_string(
+                first_row[
+                    "Entity_CD"
+                ]
+            ),
+
+        "Entity_Name":
+            clean_string(
+                first_row[
+                    "Entity_Name"
+                ]
+            ),
+
+        "Currency":
+            clean_string(
+                first_row[
+                    "Currency"
+                ]
+            ),
+
+        # ==============================================
+        # EXECUTIVE
+        # ==============================================
+
+        "Executive_Point_1":
+            result[
+                "executive_point_1"
+            ],
+
+        "Executive_Point_2":
+            result[
+                "executive_point_2"
+            ],
+
+        # ==============================================
+        # KEY MOVEMENTS
+        # ==============================================
+
+        "Key_Movement_1":
+            result[
+                "key_movement_1"
+            ],
+
+        "Key_Movement_2":
+            result[
+                "key_movement_2"
+            ],
+
+        "Key_Movement_3":
+            result[
+                "key_movement_3"
+            ],
+
+        "Key_Movement_4":
+            result[
+                "key_movement_4"
+            ],
+
+        # ==============================================
+        # TREND
+        # ==============================================
+
+        "Trend_Point_1":
+            result[
+                "trend_point_1"
+            ],
+
+        "Trend_Point_2":
+            result[
+                "trend_point_2"
+            ],
+
+        # ==============================================
+        # BUDGET / YTD
+        # ==============================================
+
+        "Budget_YTD_Point_1":
+            result[
+                "budget_ytd_point_1"
+            ],
+
+        "Budget_YTD_Point_2":
+            result[
+                "budget_ytd_point_2"
+            ],
+
+        # ==============================================
+        # FULL SUMMARY
+        # ==============================================
+
+        "Summary_Full":
+            full_summary,
+
+        "Generation_Status":
+            "PASS",
+
+        "Generation_Attempts":
+            attempts,
+
+        "Generated_At":
+            generated_at,
+
+        "Generator_Model":
+            GEMINI_MODEL,
+
+        "Generator_Thinking":
+            "MEDIUM",
+    }
+
+
+# ============================================================
+# MAIN GENERATION
+# ============================================================
+
+def run_generation(
+    limit=None,
+    force=False,
+    currency_filter=None,
+    entity_filter=None,
+):
+
+    print(
+        "\n"
+        +
+        "=" * 90
+    )
+
+    print(
+        "CASHFLOW AI - ITERATION 2"
+    )
+
+    print(
+        "RICH STRUCTURED COMMENTARY GENERATION"
+    )
+
+    print(
+        "=" * 90
     )
 
 
     print(
-        f"\nInsight rows: "
-        f"{len(insight_df)}"
+        f"\nModel: {GEMINI_MODEL}"
     )
 
     print(
-        f"Trend rows: "
-        f"{len(trend_df)}"
+        "Thinking: MEDIUM"
+    )
+
+    print(
+        "Output mode: Schema-enforced JSON"
     )
 
 
     # ========================================================
-    # SUMMARY KEYS
-    #
-    # Grain:
-    # FY × Month × Entity × Currency
+    # INPUTS
     # ========================================================
 
-    key_columns = [
-        "Fiscal_Year",
-        "Selected_Month",
-        "Selected_Month_Order",
-        "Entity_CD",
-        "Entity_Name",
-        "Currency",
-    ]
+    (
+        insight_df,
+        trend_df,
+    ) = load_inputs()
 
+
+    # ========================================================
+    # AVAILABLE SUMMARY KEYS
+    # ========================================================
 
     summary_keys = (
         insight_df[
-            key_columns
+            [
+                "Fiscal_Year",
+                "Selected_Month",
+                "Selected_Month_Order",
+                "Entity_CD",
+                "Entity_Name",
+                "Currency",
+            ]
         ]
         .drop_duplicates()
         .sort_values(
@@ -2259,123 +2072,60 @@ def main():
     )
 
 
-    # ========================================================
-    # OPTIONAL FILTERS
-    # ========================================================
-
-    if args.entity:
-
-        entity_filter = (
-            args.entity
-            .strip()
-            .lower()
-        )
-
-
-        summary_keys = (
-            summary_keys[
-                (
-                    summary_keys[
-                        "Entity_CD"
-                    ]
-                    .str.lower()
-                    ==
-                    entity_filter
-                )
-                |
-                (
-                    summary_keys[
-                        "Entity_Name"
-                    ]
-                    .str.lower()
-                    ==
-                    entity_filter
-                )
-            ]
-        )
-
-
-    if args.month:
-
-        summary_keys = (
-            summary_keys[
-                summary_keys[
-                    "Selected_Month"
-                ]
-                .str.lower()
-                ==
-                args.month
-                .strip()
-                .lower()
-            ]
-        )
-
-
-    if args.currency:
+    if currency_filter:
 
         summary_keys = (
             summary_keys[
                 summary_keys[
                     "Currency"
-                ]
+                ].str.upper()
                 ==
-                args.currency
+                currency_filter.upper()
             ]
-        )
-
-
-    if args.limit is not None:
-
-        summary_keys = (
-            summary_keys
-            .head(
-                args.limit
+            .reset_index(
+                drop=True
             )
         )
 
 
-    print(
-        f"\nSelected combinations: "
-        f"{len(summary_keys)}"
-    )
+    if entity_filter:
 
-
-    if summary_keys.empty:
-
-        print(
-            "No matching combinations found."
+        entity_filter_lower = (
+            entity_filter.lower()
         )
 
-        return
+
+        summary_keys = (
+            summary_keys[
+                summary_keys[
+                    "Entity_Name"
+                ]
+                .str.lower()
+                .str.contains(
+                    entity_filter_lower,
+                    regex=False,
+                )
+            ]
+            .reset_index(
+                drop=True
+            )
+        )
 
 
-    # ========================================================
-    # GEMINI CLIENT
-    #
-    # vertexai=True is intentionally used because it works
-    # across older/newer google-genai versions with ADC.
-    # ========================================================
+    if limit is not None:
 
-    client = genai.Client(
-
-        vertexai=True,
-
-        project=
-            PROJECT_ID,
-
-        location=
-            VERTEX_LOCATION,
-    )
+        summary_keys = (
+            summary_keys
+            .head(
+                limit
+            )
+            .copy()
+        )
 
 
     print(
-        f"Generator Model: "
-        f"{GEMINI_MODEL}"
-    )
-
-    print(
-        f"Thinking Level: "
-        f"{THINKING_LEVEL}"
+        f"\nCombinations selected: "
+        f"{len(summary_keys)}"
     )
 
 
@@ -2388,20 +2138,47 @@ def main():
     )
 
 
-    completed_keys = (
-        existing_keys(
-            output_df
-        )
-    )
+    existing_keys = set()
 
 
-    generated_count = 0
+    if not output_df.empty:
 
-    skipped_count = 0
+        for _, row in (
+            output_df.iterrows()
+        ):
 
-    warning_count = 0
+            existing_keys.add(
+                make_key(
+                    row[
+                        "Fiscal_Year"
+                    ],
+                    row[
+                        "Month"
+                    ],
+                    row[
+                        "Entity_CD"
+                    ],
+                    row[
+                        "Currency"
+                    ],
+                )
+            )
 
-    failure_count = 0
+
+    # ========================================================
+    # CLIENT
+    # ========================================================
+
+    client = create_client()
+
+
+    # ========================================================
+    # COUNTERS
+    # ========================================================
+
+    generated = 0
+    skipped = 0
+    failures = 0
 
 
     total = len(
@@ -2410,51 +2187,55 @@ def main():
 
 
     # ========================================================
-    # GENERATION LOOP
+    # GENERATE
     # ========================================================
 
-    for position, key_row in (
-        summary_keys.iterrows()
+    for position, (
+        _,
+        key_row,
+    ) in enumerate(
+        summary_keys.iterrows(),
+        start=1,
     ):
 
-        fiscal_year = (
+        fiscal_year = int(
             key_row[
                 "Fiscal_Year"
             ]
         )
 
-        month = (
+        month = clean_string(
             key_row[
                 "Selected_Month"
             ]
         )
 
-        month_order = (
+        month_order = int(
             key_row[
                 "Selected_Month_Order"
             ]
         )
 
-        entity_cd = (
+        entity_cd = clean_string(
             key_row[
                 "Entity_CD"
             ]
         )
 
-        entity_name = (
+        entity_name = clean_string(
             key_row[
                 "Entity_Name"
             ]
         )
 
-        currency = (
+        currency = clean_string(
             key_row[
                 "Currency"
             ]
         )
 
 
-        key = row_key(
+        key = make_key(
             fiscal_year,
             month,
             entity_cd,
@@ -2462,20 +2243,8 @@ def main():
         )
 
 
-        display_number = (
-            generated_count
-            +
-            skipped_count
-            +
-            failure_count
-            +
-            1
-        )
-
-
-        print()
         print(
-            f"[{display_number}/{total}] "
+            f"\n[{position}/{total}] "
             f"{entity_name} | "
             f"{month} | "
             f"{currency}"
@@ -2487,83 +2256,22 @@ def main():
         # ====================================================
 
         if (
-            key in completed_keys
+            key in existing_keys
             and
-            not args.force
+            not force
         ):
 
             print(
-                "  SKIP - already generated"
+                "    SKIPPED - already generated"
             )
 
-            skipped_count += 1
+            skipped += 1
 
             continue
 
 
         # ====================================================
-        # IF FORCE, REMOVE OLD VERSION OF THIS KEY
-        # ====================================================
-
-        if (
-            args.force
-            and
-            not output_df.empty
-        ):
-
-            match = (
-                (
-                    output_df[
-                        "Fiscal_Year"
-                    ]
-                    .apply(
-                        safe_int
-                    )
-                    ==
-                    safe_int(
-                        fiscal_year
-                    )
-                )
-                &
-                (
-                    output_df[
-                        "Month"
-                    ]
-                    ==
-                    month
-                )
-                &
-                (
-                    output_df[
-                        "Entity_CD"
-                    ]
-                    .astype(str)
-                    ==
-                    str(
-                        entity_cd
-                    )
-                )
-                &
-                (
-                    output_df[
-                        "Currency"
-                    ]
-                    ==
-                    currency
-                )
-            )
-
-
-            output_df = (
-                output_df[
-                    ~match
-                ]
-                .copy()
-            )
-
-
-        # ====================================================
-        # INSIGHT SUBSET
+        # CURRENT INSIGHTS
         # ====================================================
 
         insight_subset = (
@@ -2604,6 +2312,10 @@ def main():
         )
 
 
+        # ====================================================
+        # TREND
+        # ====================================================
+
         trend_subset = (
             trend_df[
                 (
@@ -2642,314 +2354,79 @@ def main():
         )
 
 
-        try:
-
-            fact_package = (
-                build_fact_package(
-                    insight_subset=
-                        insight_subset,
-
-                    trend_subset=
-                        trend_subset,
-                )
-            )
-
-
-            result, status, issues, attempts = (
-                generate_summary(
-
-                    client=
-                        client,
-
-                    fact_package=
-                        fact_package,
-                )
-            )
-
-
-            full_summary = (
-                build_summary_full(
-                    result
-                )
-            )
-
-
-            all_point_text = (
-                result[
-                    "executive_summary"
-                ]
-                +
-                result[
-                    "key_movements"
-                ]
-                +
-                result[
-                    "trend_insight"
-                ]
-                +
-                result[
-                    "budget_ytd"
-                ]
-            )
-
-
-            word_count = sum(
-                len(
-                    point.split()
-                )
-
-                for point
-                in all_point_text
-            )
-
-
-            generated_at = (
-                datetime.now(
-                    timezone.utc
-                )
-                .isoformat()
-            )
-
-
-            output_row = {
-
-                "Fiscal_Year":
-                    safe_int(
-                        fiscal_year
-                    ),
-
-                "Month":
-                    month,
-
-                "Month_Order":
-                    safe_int(
-                        month_order
-                    ),
-
-                "Entity_CD":
-                    entity_cd,
-
-                "Entity_Name":
-                    entity_name,
-
-                "Currency":
-                    currency,
-
-
-                # ==========================================
-                # EXECUTIVE
-                # ==========================================
-
-                "Executive_Point_1":
-                    point_at(
-                        result[
-                            "executive_summary"
-                        ],
-                        0,
-                    ),
-
-                "Executive_Point_2":
-                    point_at(
-                        result[
-                            "executive_summary"
-                        ],
-                        1,
-                    ),
-
-
-                # ==========================================
-                # KEY MOVEMENTS
-                # ==========================================
-
-                "Key_Movement_1":
-                    point_at(
-                        result[
-                            "key_movements"
-                        ],
-                        0,
-                    ),
-
-                "Key_Movement_2":
-                    point_at(
-                        result[
-                            "key_movements"
-                        ],
-                        1,
-                    ),
-
-                "Key_Movement_3":
-                    point_at(
-                        result[
-                            "key_movements"
-                        ],
-                        2,
-                    ),
-
-                "Key_Movement_4":
-                    point_at(
-                        result[
-                            "key_movements"
-                        ],
-                        3,
-                    ),
-
-
-                # ==========================================
-                # TREND
-                # ==========================================
-
-                "Trend_Point_1":
-                    point_at(
-                        result[
-                            "trend_insight"
-                        ],
-                        0,
-                    ),
-
-                "Trend_Point_2":
-                    point_at(
-                        result[
-                            "trend_insight"
-                        ],
-                        1,
-                    ),
-
-
-                # ==========================================
-                # BUDGET / YTD
-                # ==========================================
-
-                "Budget_YTD_Point_1":
-                    point_at(
-                        result[
-                            "budget_ytd"
-                        ],
-                        0,
-                    ),
-
-                "Budget_YTD_Point_2":
-                    point_at(
-                        result[
-                            "budget_ytd"
-                        ],
-                        1,
-                    ),
-
-
-                # ==========================================
-                # FULL TEXT FOR REVIEW / DEBUGGING
-                # ==========================================
-
-                "Summary_Full":
-                    full_summary,
-
-                "Word_Count":
-                    word_count,
-
-                "Review_Status":
-                    status,
-
-                "Review_Issues":
-                    issues,
-
-                "Generation_Attempts":
-                    attempts,
-
-                "Generated_At":
-                    generated_at,
-
-                "Generator_Model":
-                    GEMINI_MODEL,
-
-                "Generator_Thinking":
-                    THINKING_LEVEL,
-            }
-
-
-            output_df = pd.concat(
-                [
-                    output_df,
-                    pd.DataFrame(
-                        [
-                            output_row
-                        ]
-                    ),
-                ],
-                ignore_index=True,
-            )
-
-
-            completed_keys.add(
-                key
-            )
-
-
-            save_output(
-                output_df
-            )
-
-
-            append_log(
-                {
-
-                    "Fiscal_Year":
-                        safe_int(
-                            fiscal_year
-                        ),
-
-                    "Month":
-                        month,
-
-                    "Entity_CD":
-                        entity_cd,
-
-                    "Entity_Name":
-                        entity_name,
-
-                    "Currency":
-                        currency,
-
-                    "Status":
-                        status,
-
-                    "Issues":
-                        issues,
-
-                    "Attempts":
-                        attempts,
-
-                    "Generated_At":
-                        generated_at,
-                }
-            )
-
-
-            if status == "WARN":
-
-                warning_count += 1
-
-                print(
-                    f"  WARN - {issues}"
-                )
-
-
-            else:
-
-                print(
-                    "  PASS"
-                )
-
-
-            generated_count += 1
-
-
-        except Exception as error:
-
-            failure_count += 1
-
+        if insight_subset.empty:
 
             print(
-                f"  FAILED - {error}"
+                "    FAILED - no structured insight facts"
+            )
+
+            failures += 1
+
+            continue
+
+
+        # ====================================================
+        # FACT PACKAGE
+        # ====================================================
+
+        fact_package = (
+            build_fact_package(
+                insight_subset=
+                    insight_subset,
+                trend_subset=
+                    trend_subset,
+            )
+        )
+
+
+        # ====================================================
+        # GEMINI
+        # ====================================================
+
+        (
+            result,
+            attempts,
+            raw_response,
+            error,
+        ) = generate_one_summary(
+            client=client,
+            fact_package=fact_package,
+            selected_month_order=
+                month_order,
+        )
+
+
+        generated_at = (
+            datetime.now(
+                timezone.utc
+            )
+            .isoformat()
+        )
+
+
+        # ====================================================
+        # FAILURE
+        # ====================================================
+
+        if result is None:
+
+            print(
+                "    FAILED"
+            )
+
+            print(
+                f"    {error}"
+            )
+
+
+            failures += 1
+
+
+            save_failed_response(
+                key=key,
+                raw_response=
+                    raw_response,
+                error=error,
             )
 
 
@@ -2957,9 +2434,7 @@ def main():
                 {
 
                     "Fiscal_Year":
-                        safe_int(
-                            fiscal_year
-                        ),
+                        fiscal_year,
 
                     "Month":
                         month,
@@ -2976,55 +2451,240 @@ def main():
                     "Status":
                         "FAILED",
 
-                    "Issues":
-                        str(
-                            error
-                        ),
-
                     "Attempts":
-                        MAX_ATTEMPTS,
+                        attempts,
+
+                    "Issue":
+                        error,
 
                     "Generated_At":
-                        datetime.now(
-                            timezone.utc
-                        ).isoformat(),
+                        generated_at,
                 }
             )
+
+
+            continue
+
+
+        # ====================================================
+        # SUCCESS
+        # ====================================================
+
+        print(
+            f"    PASS "
+            f"(attempt {attempts})"
+        )
+
+
+        output_row = (
+            build_output_row(
+                first_row=
+                    insight_subset.iloc[0],
+                result=result,
+                attempts=attempts,
+            )
+        )
+
+
+        # Remove prior version if --force.
+
+        output_df = (
+            remove_existing_key(
+                output_df,
+                key,
+            )
+        )
+
+
+        output_df = pd.concat(
+            [
+                output_df,
+                pd.DataFrame(
+                    [
+                        output_row
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+
+
+        save_output(
+            output_df
+        )
+
+
+        existing_keys.add(
+            key
+        )
+
+
+        generated += 1
+
+
+        append_log(
+            {
+
+                "Fiscal_Year":
+                    fiscal_year,
+
+                "Month":
+                    month,
+
+                "Entity_CD":
+                    entity_cd,
+
+                "Entity_Name":
+                    entity_name,
+
+                "Currency":
+                    currency,
+
+                "Status":
+                    "PASS",
+
+                "Attempts":
+                    attempts,
+
+                "Issue":
+                    "",
+
+                "Generated_At":
+                    generated_at,
+            }
+        )
 
 
     # ========================================================
     # FINAL STATUS
     # ========================================================
 
-    print()
-    print("=" * 90)
-    print("ITERATION-2 GENERATION COMPLETE")
-    print("=" * 90)
-
     print(
-        f"Generated: {generated_count}"
+        "\n"
+        +
+        "=" * 90
     )
 
     print(
-        f"Skipped:   {skipped_count}"
+        "ITERATION-2 GENERATION COMPLETE"
     )
 
     print(
-        f"Warnings:  {warning_count}"
+        "=" * 90
+    )
+
+
+    print(
+        f"\nGenerated: {generated}"
     )
 
     print(
-        f"Failures:  {failure_count}"
+        f"Skipped:   {skipped}"
     )
 
     print(
-        f"\nOutput:\n"
-        f"{OUTPUT_FILE.resolve()}"
+        f"Failures:  {failures}"
+    )
+
+
+    print(
+        "\nOutput:"
     )
 
     print(
-        f"\nLog:\n"
-        f"{LOG_FILE.resolve()}"
+        OUTPUT_FILE.resolve()
+    )
+
+
+    print(
+        "\nLog:"
+    )
+
+    print(
+        LOG_FILE.resolve()
+    )
+
+
+    if failures > 0:
+
+        print(
+            "\nRaw failed responses:"
+        )
+
+        print(
+            RAW_FAILURE_DIR.resolve()
+        )
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate Iteration-2 rich "
+            "Cashflow AI commentary."
+        )
+    )
+
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Generate only the first N "
+            "summary combinations."
+        ),
+    )
+
+
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Regenerate combinations that "
+            "already exist."
+        ),
+    )
+
+
+    parser.add_argument(
+        "--currency",
+        type=str,
+        default=None,
+        choices=[
+            "EUR",
+            "LC",
+        ],
+        help=(
+            "Optional currency filter."
+        ),
+    )
+
+
+    parser.add_argument(
+        "--entity",
+        type=str,
+        default=None,
+        help=(
+            "Optional entity-name search."
+        ),
+    )
+
+
+    args = parser.parse_args()
+
+
+    run_generation(
+        limit=args.limit,
+        force=args.force,
+        currency_filter=
+            args.currency,
+        entity_filter=
+            args.entity,
     )
 
 
