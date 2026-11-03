@@ -1,0 +1,6 @@
+﻿Fiscal_Year,Month,Entity_CD,Entity_Name,Currency,Status,Issues,Attempts,Generated_At
+2027,Sep,EU000.DE000,Europe.Germany,LC,FAILED,Gemini failed to return a usable structured response after 3 attempts.,3,2026-11-03T15:49:02.883600+00:00
+2027,Sep,EU000.EU001,Europe.Other Europe,LC,PASS,,2,2026-11-03T15:49:36.178067+00:00
+2027,Sep,EU000.GB000,Europe.UK,LC,FAILED,Gemini failed to return a usable structured response after 3 attempts.,3,2026-11-03T15:50:42.570940+00:00
+2027,Sep,IFRSHierarchy.VF400,IFRSHierarchy.Vodafone Group (IFRSHierarchy.VF400),LC,PASS,,1,2026-11-03T15:51:02.025673+00:00
+2027,Sep,CF100.TO000,Other Common Functions (CC100.CF100).IoT,LC,FAILED,Gemini failed to return a usable structured response after 3 attempts.,3,2026-11-03T15:52:03.909302+00:00
