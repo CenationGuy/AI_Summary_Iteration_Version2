@@ -12,7 +12,6 @@ from config import PROJECT_ID, DATASET_ID
 # ============================================================
 
 MAPPING_FILE = Path("output/page1_final_account_mapping.csv")
-
 OUTPUT_FILE = Path("output/page1_enriched_analysis.csv")
 
 
@@ -41,15 +40,20 @@ END
 
 # ============================================================
 # CURRENCY MAPPING
+#
+# CONFIRMED FROM BIGQUERY:
+#
+# FM Parent Curr Total → EUR
+# FM Entity Curr Total → LC
 # ============================================================
 
 CURRENCY_MAPPING_SQL = """
 CASE
 
-    WHEN UPPER(TRIM(Currency_CD)) = 'PARENTCURRENCY TOTAL'
+    WHEN UPPER(TRIM(Currency_CD)) = 'FM PARENT CURR TOTAL'
         THEN 'EUR'
 
-    WHEN UPPER(TRIM(Currency_CD)) = 'ENTITY CURRENCY TOTAL'
+    WHEN UPPER(TRIM(Currency_CD)) = 'FM ENTITY CURR TOTAL'
         THEN 'LC'
 
     ELSE NULL
@@ -71,13 +75,10 @@ def get_latest_year(client):
                 Year AS INT64
             )
         ) AS latest_year
-
     FROM `{PROJECT_ID}.{DATASET_ID}.CF`
     """
 
-    df = client.query(
-        query
-    ).to_dataframe()
+    df = client.query(query).to_dataframe()
 
     if df.empty:
         return None
@@ -99,8 +100,7 @@ def load_mapping():
     if not MAPPING_FILE.exists():
 
         raise FileNotFoundError(
-            f"Mapping file not found: "
-            f"{MAPPING_FILE.resolve()}"
+            f"Mapping file not found: {MAPPING_FILE.resolve()}"
         )
 
     mapping_df = pd.read_csv(
@@ -141,15 +141,17 @@ def extract_page1_data(
             Year AS INT64
         ) = @year
 
-          AND Scenario_CD =
-              'ACTUAL_CONS'
+          AND Scenario_CD = 'ACTUAL_CONS'
+
+          AND UPPER(TRIM(Currency_CD)) IN (
+              'FM PARENT CURR TOTAL',
+              'FM ENTITY CURR TOTAL'
+          )
 
         GROUP BY
             Month
 
-        HAVING COUNTIF(
-            Value != 0
-        ) > 0
+        HAVING COUNTIF(Value != 0) > 0
     ),
 
     base AS (
@@ -162,8 +164,7 @@ def extract_page1_data(
 
             Month,
 
-            {MONTH_ORDER_SQL}
-                AS Month_Order,
+            {MONTH_ORDER_SQL} AS Month_Order,
 
             Entity_CD,
 
@@ -177,24 +178,11 @@ def extract_page1_data(
 
             View_CD,
 
-            -- ==============================================
-            -- RAW CURRENCY FIELD FROM SOURCE
-            -- ==============================================
-
+            -- Raw BigQuery member
             Currency_CD AS Currency_CD_Raw,
 
-            -- ==============================================
-            -- ITERATION-2 BUSINESS CURRENCY
-            --
-            -- ParentCurrency Total
-            --      → EUR
-            --
-            -- Entity Currency Total
-            --      → LC
-            -- ==============================================
-
-            {CURRENCY_MAPPING_SQL}
-                AS Currency,
+            -- Business-friendly currency for AI + SAC
+            {CURRENCY_MAPPING_SQL} AS Currency,
 
             Value
 
@@ -205,10 +193,7 @@ def extract_page1_data(
         ) = @year
 
           AND Month IN (
-
-              SELECT
-                  Month
-
+              SELECT Month
               FROM loaded_months
           )
 
@@ -216,36 +201,20 @@ def extract_page1_data(
               @account_codes
           )
 
-          -- ==============================================
-          -- ONLY THE TWO REQUIRED CURRENCY VIEWS
-          -- ==============================================
-
-          AND UPPER(
-                TRIM(
-                    Currency_CD
-                )
-              ) IN (
-
-                'PARENTCURRENCY TOTAL',
-
-                'ENTITY CURRENCY TOTAL'
-              )
+          AND UPPER(TRIM(Currency_CD)) IN (
+              'FM PARENT CURR TOTAL',
+              'FM ENTITY CURR TOTAL'
+          )
 
           AND Scenario_CD IN (
-
               'ACTUAL_CONS',
-
               'BUDGET_CONS',
-
               'ACTUAL_RESTATE_V_BUDGET_CONS',
-
               'YoYAbs_ACTUAL_CONS_V_ACTUAL_CONS'
           )
 
           AND View_CD IN (
-
               'Periodic',
-
               'Year-To-Date'
           )
     )
@@ -272,171 +241,111 @@ def extract_page1_data(
         Account_Name,
 
 
-        -- ==============================================
+        -- ==================================================
         -- PERIODIC ACTUAL
-        -- ==============================================
+        -- ==================================================
 
         MAX(
-
             CASE
-
-                WHEN View_CD =
-                     'Periodic'
-
-                 AND Scenario_CD =
-                     'ACTUAL_CONS'
-
+                WHEN View_CD = 'Periodic'
+                 AND Scenario_CD = 'ACTUAL_CONS'
                 THEN Value
-
             END
-
         ) AS Periodic_Actual,
 
 
-        -- ==============================================
+        -- ==================================================
         -- PERIODIC BUDGET
-        -- ==============================================
+        -- ==================================================
 
         MAX(
-
             CASE
-
-                WHEN View_CD =
-                     'Periodic'
-
-                 AND Scenario_CD =
-                     'BUDGET_CONS'
-
+                WHEN View_CD = 'Periodic'
+                 AND Scenario_CD = 'BUDGET_CONS'
                 THEN Value
-
             END
-
         ) AS Periodic_Budget,
 
 
-        -- ==============================================
+        -- ==================================================
         -- PERIODIC VS BUDGET
-        -- ==============================================
+        -- ==================================================
 
         MAX(
-
             CASE
-
-                WHEN View_CD =
-                     'Periodic'
-
+                WHEN View_CD = 'Periodic'
                  AND Scenario_CD =
                      'ACTUAL_RESTATE_V_BUDGET_CONS'
-
                 THEN Value
-
             END
-
         ) AS Periodic_Vs_Budget,
 
 
-        -- ==============================================
+        -- ==================================================
         -- PERIODIC YOY
-        -- ==============================================
+        -- ==================================================
 
         MAX(
-
             CASE
-
-                WHEN View_CD =
-                     'Periodic'
-
+                WHEN View_CD = 'Periodic'
                  AND Scenario_CD =
                      'YoYAbs_ACTUAL_CONS_V_ACTUAL_CONS'
-
                 THEN Value
-
             END
-
         ) AS Periodic_YoY_Abs,
 
 
-        -- ==============================================
+        -- ==================================================
         -- YTD ACTUAL
-        -- ==============================================
+        -- ==================================================
 
         MAX(
-
             CASE
-
-                WHEN View_CD =
-                     'Year-To-Date'
-
-                 AND Scenario_CD =
-                     'ACTUAL_CONS'
-
+                WHEN View_CD = 'Year-To-Date'
+                 AND Scenario_CD = 'ACTUAL_CONS'
                 THEN Value
-
             END
-
         ) AS YTD_Actual,
 
 
-        -- ==============================================
+        -- ==================================================
         -- YTD BUDGET
-        -- ==============================================
+        -- ==================================================
 
         MAX(
-
             CASE
-
-                WHEN View_CD =
-                     'Year-To-Date'
-
-                 AND Scenario_CD =
-                     'BUDGET_CONS'
-
+                WHEN View_CD = 'Year-To-Date'
+                 AND Scenario_CD = 'BUDGET_CONS'
                 THEN Value
-
             END
-
         ) AS YTD_Budget,
 
 
-        -- ==============================================
+        -- ==================================================
         -- YTD VS BUDGET
-        -- ==============================================
+        -- ==================================================
 
         MAX(
-
             CASE
-
-                WHEN View_CD =
-                     'Year-To-Date'
-
+                WHEN View_CD = 'Year-To-Date'
                  AND Scenario_CD =
                      'ACTUAL_RESTATE_V_BUDGET_CONS'
-
                 THEN Value
-
             END
-
         ) AS YTD_Vs_Budget,
 
 
-        -- ==============================================
+        -- ==================================================
         -- YTD YOY
-        -- ==============================================
+        -- ==================================================
 
         MAX(
-
             CASE
-
-                WHEN View_CD =
-                     'Year-To-Date'
-
+                WHEN View_CD = 'Year-To-Date'
                  AND Scenario_CD =
                      'YoYAbs_ACTUAL_CONS_V_ACTUAL_CONS'
-
                 THEN Value
-
             END
-
         ) AS YTD_YoY_Abs
 
 
@@ -524,11 +433,9 @@ def calculate_pct_change(
     return (
         (
             current
-            -
-            previous
+            - previous
         )
-        /
-        abs(previous)
+        / abs(previous)
     ) * 100
 
 
@@ -539,22 +446,14 @@ def calculate_pct_change(
 def normalize_strings(df):
 
     string_columns = [
-
         "Month",
-
         "Entity_CD",
-
         "Entity_Name",
-
         "Currency",
-
         "Currency_CD_Raw",
-
         "Account_CD",
-
         "Account_Name",
     ]
-
 
     for column in string_columns:
 
@@ -576,18 +475,13 @@ def normalize_strings(df):
 
 def add_comparisons(df):
 
-    df = normalize_strings(
-        df
-    )
+    df = normalize_strings(df)
 
 
     # ========================================================
     # SORT AT CORRECT ITERATION-2 GRAIN
     #
-    # Entity
-    # × Currency
-    # × Account
-    # × Month
+    # Entity × Currency × Account × Month
     # ========================================================
 
     df = (
@@ -601,17 +495,17 @@ def add_comparisons(df):
                 "Month_Order",
             ]
         )
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
 
 
     # ========================================================
-    # CURRENCY IS CRITICAL HERE
+    # IMPORTANT
     #
-    # EUR will only compare with EUR.
-    # LC will only compare with LC.
+    # Currency is part of the grouping.
+    #
+    # EUR compares only against EUR.
+    # LC compares only against LC.
     # ========================================================
 
     groups = df.groupby(
@@ -642,7 +536,7 @@ def add_comparisons(df):
 
 
     # ========================================================
-    # MONTH-ON-MONTH
+    # MOM CHANGE
     # ========================================================
 
     df["MoM_Change"] = (
@@ -653,8 +547,7 @@ def add_comparisons(df):
 
 
     df["MoM_Pct"] = df.apply(
-        lambda row:
-        calculate_pct_change(
+        lambda row: calculate_pct_change(
             row["Periodic_Actual"],
             row["Previous_Periodic_Actual"],
         ),
@@ -747,7 +640,7 @@ def add_comparisons(df):
 
 
     # ========================================================
-    # ABSOLUTE MOVEMENTS
+    # ABSOLUTE MOVEMENT FIELDS
     # ========================================================
 
     df["Abs_MoM_Change"] = (
@@ -776,6 +669,8 @@ def add_comparisons(df):
 
     # ========================================================
     # MATERIALITY SCORE
+    #
+    # Used later for selecting important drivers.
     # ========================================================
 
     df["Materiality_Score"] = (
@@ -819,14 +714,8 @@ def validate_grain(df):
     )
 
 
-    print(
-        "\nGRAIN VALIDATION"
-    )
-
-    print(
-        "=" * 80
-    )
-
+    print("\nGRAIN VALIDATION")
+    print("=" * 80)
 
     print(
         "Expected grain:"
@@ -835,7 +724,6 @@ def validate_grain(df):
     print(
         "Fiscal Year × Month × Entity × Currency × Account"
     )
-
 
     print(
         f"\nDuplicate rows at expected grain: "
@@ -846,7 +734,7 @@ def validate_grain(df):
     if duplicate_count == 0:
 
         print(
-            "PASS: No duplicates at the expected grain."
+            "PASS: No duplicates at expected grain."
         )
 
     else:
@@ -862,13 +750,8 @@ def validate_grain(df):
 
 def validate_currency(df):
 
-    print(
-        "\nCURRENCY VALIDATION"
-    )
-
-    print(
-        "=" * 80
-    )
+    print("\nCURRENCY VALIDATION")
+    print("=" * 80)
 
 
     mapping = (
@@ -879,9 +762,7 @@ def validate_currency(df):
             ]
         ]
         .drop_duplicates()
-        .sort_values(
-            "Currency"
-        )
+        .sort_values("Currency")
     )
 
 
@@ -936,16 +817,16 @@ def validate_currency(df):
         )
 
         print(
-            f"Expected currencies: {expected}"
+            f"Expected: {expected}"
         )
 
         print(
-            f"Found currencies: {currencies}"
+            f"Found: {currencies}"
         )
 
 
 # ============================================================
-# SHOW EUR / LC SAMPLE
+# SHOW SAMPLE WITH BOTH EUR AND LC
 # ============================================================
 
 def print_currency_sample(df):
@@ -976,47 +857,38 @@ def print_currency_sample(df):
     )
 
 
-    candidates = entity_currency_counts[
+    candidates = (
         entity_currency_counts[
-            "Currency_Count"
-        ] >= 2
-    ]
+            entity_currency_counts[
+                "Currency_Count"
+            ] >= 2
+        ]
+    )
 
 
     if candidates.empty:
 
         print(
-            "\nNo entity with both EUR and LC "
-            "was found."
+            "\nNo entity with both EUR and LC found."
         )
 
         return
 
 
-    entity_cd = (
-        candidates.iloc[0][
-            "Entity_CD"
-        ]
-    )
+    entity_cd = candidates.iloc[0]["Entity_CD"]
 
-
-    entity_name = (
-        candidates.iloc[0][
-            "Entity_Name"
-        ]
-    )
+    entity_name = candidates.iloc[0]["Entity_Name"]
 
 
     sample = (
         df[
-            df["Entity_CD"]
-            ==
-            entity_cd
+            df["Entity_CD"] == entity_cd
         ]
         [
             [
                 "Entity_Name",
                 "Month",
+                "Month_Order",
                 "Currency",
                 "Currency_CD_Raw",
                 "Account_Name",
@@ -1030,16 +902,10 @@ def print_currency_sample(df):
             [
                 "Account_Name",
                 "Currency",
-                "Month_Order"
-            ]
-            if "Month_Order" in df.columns
-            else
-            [
-                "Account_Name",
-                "Currency",
-                "Month",
+                "Month_Order",
             ]
         )
+        .head(40)
     )
 
 
@@ -1058,9 +924,80 @@ def print_currency_sample(df):
 
 
     print(
-        sample.head(40)
-        .to_string(
+        sample.to_string(
             index=False
+        )
+    )
+
+
+# ============================================================
+# FINAL DATASET SUMMARY
+# ============================================================
+
+def print_dataset_summary(df):
+
+    print(
+        "\nDATASET STATUS"
+    )
+
+    print(
+        "=" * 80
+    )
+
+
+    print(
+        f"Rows: {len(df)}"
+    )
+
+
+    print(
+        f"Entities: "
+        f"{df['Entity_CD'].nunique()}"
+    )
+
+
+    print(
+        f"Months: "
+        f"{df['Month'].nunique()}"
+    )
+
+
+    print(
+        f"Accounts: "
+        f"{df['Account_CD'].nunique()}"
+    )
+
+
+    print(
+        f"Currencies: "
+        f"{df['Currency'].nunique()}"
+    )
+
+
+    month_summary = (
+        df[
+            [
+                "Month_Order",
+                "Month",
+            ]
+        ]
+        .drop_duplicates()
+        .sort_values(
+            "Month_Order"
+        )
+    )
+
+
+    print(
+        "\nLoaded Months:"
+    )
+
+
+    print(
+        ", ".join(
+            month_summary[
+                "Month"
+            ].tolist()
         )
     )
 
@@ -1085,7 +1022,7 @@ def main():
 
 
     # ========================================================
-    # ACCOUNT MAPPING
+    # LOAD PAGE-1 ACCOUNT MAPPING
     # ========================================================
 
     mapping_df = load_mapping()
@@ -1107,7 +1044,7 @@ def main():
 
 
     # ========================================================
-    # BIGQUERY
+    # BIGQUERY CLIENT
     # ========================================================
 
     client = bigquery.Client(
@@ -1136,20 +1073,17 @@ def main():
 
 
     # ========================================================
-    # EXTRACT
+    # EXTRACT DATA
     # ========================================================
 
     print(
-        "\nExtracting Page-1 data..."
+        "\nExtracting EUR / LC Page-1 data..."
     )
 
 
     df = extract_page1_data(
-
         client=client,
-
         year=latest_year,
-
         account_codes=account_codes,
     )
 
@@ -1157,18 +1091,23 @@ def main():
     if df.empty:
 
         print(
-            "No Page-1 data returned."
+            "\nNo Page-1 data returned."
+        )
+
+        print(
+            "Check Currency_CD, account mapping, "
+            "scenario and view filters."
         )
 
         return
 
 
     # ========================================================
-    # ADD COMPARISONS
+    # CALCULATIONS
     # ========================================================
 
     print(
-        "Building EUR / LC-aware comparisons..."
+        "Building Currency-aware comparisons..."
     )
 
 
@@ -1178,82 +1117,13 @@ def main():
 
 
     # ========================================================
-    # STATUS
+    # VALIDATION
     # ========================================================
 
-    print(
-        "\nDATASET STATUS"
+    print_dataset_summary(
+        df
     )
 
-    print(
-        "=" * 80
-    )
-
-
-    print(
-        f"Rows: "
-        f"{len(df)}"
-    )
-
-
-    print(
-        f"Entities: "
-        f"{df['Entity_CD'].nunique()}"
-    )
-
-
-    print(
-        f"Months: "
-        f"{df['Month'].nunique()}"
-    )
-
-
-    print(
-        f"Accounts: "
-        f"{df['Account_CD'].nunique()}"
-    )
-
-
-    print(
-        f"Currencies: "
-        f"{df['Currency'].nunique()}"
-    )
-
-
-    # ========================================================
-    # LOADED MONTHS
-    # ========================================================
-
-    month_summary = (
-        df[
-            [
-                "Month_Order",
-                "Month",
-            ]
-        ]
-        .drop_duplicates()
-        .sort_values(
-            "Month_Order"
-        )
-    )
-
-
-    print(
-        "\nLoaded Months:"
-    )
-
-
-    print(
-        ", ".join(
-            month_summary["Month"]
-            .tolist()
-        )
-    )
-
-
-    # ========================================================
-    # VALIDATIONS
-    # ========================================================
 
     validate_grain(
         df
@@ -1271,7 +1141,7 @@ def main():
 
 
     # ========================================================
-    # SAVE
+    # SAVE OUTPUT
     # ========================================================
 
     OUTPUT_FILE.parent.mkdir(
@@ -1309,7 +1179,8 @@ def main():
 
 
     print(
-        "\nITERATION-2 ENRICHED ANALYSIS COMPLETED."
+        "\nITERATION-2 CURRENCY-AWARE "
+        "ENRICHED ANALYSIS COMPLETED."
     )
 
 
