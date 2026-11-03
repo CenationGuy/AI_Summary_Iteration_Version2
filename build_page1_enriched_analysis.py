@@ -2,26 +2,18 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
 from google.cloud import bigquery
 
-from config import (
-    PROJECT_ID,
-    DATASET_ID,
-)
+from config import PROJECT_ID, DATASET_ID
 
 
 # ============================================================
 # FILES
 # ============================================================
 
-MAPPING_FILE = Path(
-    "output/page1_final_account_mapping.csv"
-)
+MAPPING_FILE = Path("output/page1_final_account_mapping.csv")
 
-OUTPUT_FILE = Path(
-    "output/page1_enriched_analysis.csv"
-)
+OUTPUT_FILE = Path("output/page1_enriched_analysis.csv")
 
 
 # ============================================================
@@ -48,6 +40,25 @@ END
 
 
 # ============================================================
+# CURRENCY MAPPING
+# ============================================================
+
+CURRENCY_MAPPING_SQL = """
+CASE
+
+    WHEN UPPER(TRIM(Currency_CD)) = 'PARENTCURRENCY TOTAL'
+        THEN 'EUR'
+
+    WHEN UPPER(TRIM(Currency_CD)) = 'ENTITY CURRENCY TOTAL'
+        THEN 'LC'
+
+    ELSE NULL
+
+END
+"""
+
+
+# ============================================================
 # LATEST FISCAL YEAR
 # ============================================================
 
@@ -68,25 +79,15 @@ def get_latest_year(client):
         query
     ).to_dataframe()
 
-
     if df.empty:
-
         return None
 
-
-    value = df.iloc[0][
-        "latest_year"
-    ]
-
+    value = df.iloc[0]["latest_year"]
 
     if pd.isna(value):
-
         return None
 
-
-    return int(
-        value
-    )
+    return int(value)
 
 
 # ============================================================
@@ -102,7 +103,6 @@ def load_mapping():
             f"{MAPPING_FILE.resolve()}"
         )
 
-
     mapping_df = pd.read_csv(
         MAPPING_FILE,
         dtype={
@@ -110,20 +110,11 @@ def load_mapping():
         },
     )
 
-
-    mapping_df[
-        "Account_CD"
-    ] = (
-
-        mapping_df[
-            "Account_CD"
-        ]
-
+    mapping_df["Account_CD"] = (
+        mapping_df["Account_CD"]
         .astype(str)
-
         .str.strip()
     )
-
 
     return mapping_df
 
@@ -186,42 +177,24 @@ def extract_page1_data(
 
             View_CD,
 
-            Currency,
+            -- ==============================================
+            -- RAW CURRENCY FIELD FROM SOURCE
+            -- ==============================================
 
-            Currency_CD,
+            Currency_CD AS Currency_CD_Raw,
 
             -- ==============================================
-            -- CURRENCY KEY
-            -- ==============================================
+            -- ITERATION-2 BUSINESS CURRENCY
             --
-            -- This gives us one stable grouping key.
+            -- ParentCurrency Total
+            --      → EUR
             --
-            -- Prefer Currency_CD.
-            -- If Currency_CD is blank/null,
-            -- fall back to Currency.
+            -- Entity Currency Total
+            --      → LC
             -- ==============================================
 
-            COALESCE(
-                NULLIF(
-                    TRIM(
-                        CAST(
-                            Currency_CD
-                            AS STRING
-                        )
-                    ),
-                    ''
-                ),
-                NULLIF(
-                    TRIM(
-                        CAST(
-                            Currency
-                            AS STRING
-                        )
-                    ),
-                    ''
-                ),
-                'UNKNOWN'
-            ) AS Currency_Key,
+            {CURRENCY_MAPPING_SQL}
+                AS Currency,
 
             Value
 
@@ -239,9 +212,23 @@ def extract_page1_data(
               FROM loaded_months
           )
 
-          AND Account_CD
-              IN UNNEST(
-                  @account_codes
+          AND Account_CD IN UNNEST(
+              @account_codes
+          )
+
+          -- ==============================================
+          -- ONLY THE TWO REQUIRED CURRENCY VIEWS
+          -- ==============================================
+
+          AND UPPER(
+                TRIM(
+                    Currency_CD
+                )
+              ) IN (
+
+                'PARENTCURRENCY TOTAL',
+
+                'ENTITY CURRENCY TOTAL'
               )
 
           AND Scenario_CD IN (
@@ -278,9 +265,7 @@ def extract_page1_data(
 
         Currency,
 
-        Currency_CD,
-
-        Currency_Key,
+        Currency_CD_Raw,
 
         Account_CD,
 
@@ -288,7 +273,7 @@ def extract_page1_data(
 
 
         -- ==============================================
-        -- PERIODIC
+        -- PERIODIC ACTUAL
         -- ==============================================
 
         MAX(
@@ -308,6 +293,10 @@ def extract_page1_data(
         ) AS Periodic_Actual,
 
 
+        -- ==============================================
+        -- PERIODIC BUDGET
+        -- ==============================================
+
         MAX(
 
             CASE
@@ -325,6 +314,10 @@ def extract_page1_data(
         ) AS Periodic_Budget,
 
 
+        -- ==============================================
+        -- PERIODIC VS BUDGET
+        -- ==============================================
+
         MAX(
 
             CASE
@@ -341,6 +334,10 @@ def extract_page1_data(
 
         ) AS Periodic_Vs_Budget,
 
+
+        -- ==============================================
+        -- PERIODIC YOY
+        -- ==============================================
 
         MAX(
 
@@ -360,7 +357,7 @@ def extract_page1_data(
 
 
         -- ==============================================
-        -- YTD
+        -- YTD ACTUAL
         -- ==============================================
 
         MAX(
@@ -380,6 +377,10 @@ def extract_page1_data(
         ) AS YTD_Actual,
 
 
+        -- ==============================================
+        -- YTD BUDGET
+        -- ==============================================
+
         MAX(
 
             CASE
@@ -397,6 +398,10 @@ def extract_page1_data(
         ) AS YTD_Budget,
 
 
+        -- ==============================================
+        -- YTD VS BUDGET
+        -- ==============================================
+
         MAX(
 
             CASE
@@ -413,6 +418,10 @@ def extract_page1_data(
 
         ) AS YTD_Vs_Budget,
 
+
+        -- ==============================================
+        -- YTD YOY
+        -- ==============================================
 
         MAX(
 
@@ -433,6 +442,8 @@ def extract_page1_data(
 
     FROM base
 
+    WHERE Currency IS NOT NULL
+
 
     GROUP BY
 
@@ -448,9 +459,7 @@ def extract_page1_data(
 
         Currency,
 
-        Currency_CD,
-
-        Currency_Key,
+        Currency_CD_Raw,
 
         Account_CD,
 
@@ -461,7 +470,7 @@ def extract_page1_data(
 
         Entity_Name,
 
-        Currency_Key,
+        Currency,
 
         Account_Name,
 
@@ -469,33 +478,28 @@ def extract_page1_data(
     """
 
 
-    job_config = (
-        bigquery.QueryJobConfig(
+    job_config = bigquery.QueryJobConfig(
 
-            query_parameters=[
+        query_parameters=[
 
-                bigquery.ScalarQueryParameter(
-                    "year",
-                    "INT64",
-                    year,
-                ),
+            bigquery.ScalarQueryParameter(
+                "year",
+                "INT64",
+                year,
+            ),
 
-                bigquery.ArrayQueryParameter(
-                    "account_codes",
-                    "STRING",
-                    account_codes,
-                ),
-            ]
-        )
+            bigquery.ArrayQueryParameter(
+                "account_codes",
+                "STRING",
+                account_codes,
+            ),
+        ]
     )
 
 
     return client.query(
-
         query,
-
         job_config=job_config,
-
     ).to_dataframe()
 
 
@@ -509,37 +513,27 @@ def calculate_pct_change(
 ):
 
     if pd.isna(current):
-
         return np.nan
-
 
     if pd.isna(previous):
-
         return np.nan
-
 
     if previous == 0:
-
         return np.nan
 
-
     return (
-
         (
             current
             -
             previous
         )
-
-        / abs(
-            previous
-        )
-
+        /
+        abs(previous)
     ) * 100
 
 
 # ============================================================
-# NORMALIZE STRING COLUMNS
+# NORMALIZE STRINGS
 # ============================================================
 
 def normalize_strings(df):
@@ -554,9 +548,7 @@ def normalize_strings(df):
 
         "Currency",
 
-        "Currency_CD",
-
-        "Currency_Key",
+        "Currency_CD_Raw",
 
         "Account_CD",
 
@@ -568,27 +560,18 @@ def normalize_strings(df):
 
         if column in df.columns:
 
-            df[
-                column
-            ] = (
-
-                df[
-                    column
-                ]
-
+            df[column] = (
+                df[column]
                 .fillna("")
-
                 .astype(str)
-
                 .str.strip()
             )
-
 
     return df
 
 
 # ============================================================
-# BUILD COMPARISONS
+# ADD COMPARISONS
 # ============================================================
 
 def add_comparisons(df):
@@ -599,59 +582,45 @@ def add_comparisons(df):
 
 
     # ========================================================
-    # VERY IMPORTANT
+    # SORT AT CORRECT ITERATION-2 GRAIN
     #
-    # Currency_Key is now inside sorting and grouping.
-    #
-    # Therefore:
-    #
-    # Germany + EUR + EBITDA
-    #
-    # is completely separate from:
-    #
-    # Germany + LC + EBITDA
-    #
+    # Entity
+    # × Currency
+    # × Account
+    # × Month
     # ========================================================
 
     df = (
-
         df
-
         .sort_values(
-
             [
-
                 "Entity_CD",
-
-                "Currency_Key",
-
+                "Currency",
                 "Account_CD",
-
                 "Fiscal_Year",
-
                 "Month_Order",
             ]
         )
-
         .reset_index(
             drop=True
         )
     )
 
 
+    # ========================================================
+    # CURRENCY IS CRITICAL HERE
+    #
+    # EUR will only compare with EUR.
+    # LC will only compare with LC.
+    # ========================================================
+
     groups = df.groupby(
-
         [
-
             "Entity_CD",
-
-            "Currency_Key",
-
+            "Currency",
             "Account_CD",
         ],
-
         sort=False,
-
         dropna=False,
     )
 
@@ -660,57 +629,35 @@ def add_comparisons(df):
     # PREVIOUS MONTH
     # ========================================================
 
-    df[
-        "Previous_Month"
-    ] = groups[
-        "Month"
-    ].shift(1)
-
-
-    df[
-        "Previous_Periodic_Actual"
-    ] = groups[
-        "Periodic_Actual"
-    ].shift(1)
-
-
-    # ========================================================
-    # MONTH-ON-MONTH CHANGE
-    # ========================================================
-
-    df[
-        "MoM_Change"
-    ] = (
-
-        df[
-            "Periodic_Actual"
-        ]
-
-        -
-
-        df[
-            "Previous_Periodic_Actual"
-        ]
+    df["Previous_Month"] = (
+        groups["Month"]
+        .shift(1)
     )
 
 
-    df[
-        "MoM_Pct"
-    ] = df.apply(
+    df["Previous_Periodic_Actual"] = (
+        groups["Periodic_Actual"]
+        .shift(1)
+    )
 
+
+    # ========================================================
+    # MONTH-ON-MONTH
+    # ========================================================
+
+    df["MoM_Change"] = (
+        df["Periodic_Actual"]
+        -
+        df["Previous_Periodic_Actual"]
+    )
+
+
+    df["MoM_Pct"] = df.apply(
         lambda row:
-
         calculate_pct_change(
-
-            row[
-                "Periodic_Actual"
-            ],
-
-            row[
-                "Previous_Periodic_Actual"
-            ],
+            row["Periodic_Actual"],
+            row["Previous_Periodic_Actual"],
         ),
-
         axis=1,
     )
 
@@ -719,26 +666,16 @@ def add_comparisons(df):
     # TWO MONTHS AGO
     # ========================================================
 
-    df[
-        "Two_Months_Ago_Actual"
-    ] = groups[
-        "Periodic_Actual"
-    ].shift(2)
+    df["Two_Months_Ago_Actual"] = (
+        groups["Periodic_Actual"]
+        .shift(2)
+    )
 
 
-    df[
-        "Two_Month_Change"
-    ] = (
-
-        df[
-            "Periodic_Actual"
-        ]
-
+    df["Two_Month_Change"] = (
+        df["Periodic_Actual"]
         -
-
-        df[
-            "Two_Months_Ago_Actual"
-        ]
+        df["Two_Months_Ago_Actual"]
     )
 
 
@@ -746,26 +683,16 @@ def add_comparisons(df):
     # THREE MONTHS AGO
     # ========================================================
 
-    df[
-        "Three_Months_Ago_Actual"
-    ] = groups[
-        "Periodic_Actual"
-    ].shift(3)
+    df["Three_Months_Ago_Actual"] = (
+        groups["Periodic_Actual"]
+        .shift(3)
+    )
 
 
-    df[
-        "Three_Month_Change"
-    ] = (
-
-        df[
-            "Periodic_Actual"
-        ]
-
+    df["Three_Month_Change"] = (
+        df["Periodic_Actual"]
         -
-
-        df[
-            "Three_Months_Ago_Actual"
-        ]
+        df["Three_Months_Ago_Actual"]
     )
 
 
@@ -773,19 +700,10 @@ def add_comparisons(df):
     # ACTUAL MINUS BUDGET
     # ========================================================
 
-    df[
-        "Actual_Minus_Budget"
-    ] = (
-
-        df[
-            "Periodic_Actual"
-        ]
-
+    df["Actual_Minus_Budget"] = (
+        df["Periodic_Actual"]
         -
-
-        df[
-            "Periodic_Budget"
-        ]
+        df["Periodic_Budget"]
     )
 
 
@@ -793,49 +711,32 @@ def add_comparisons(df):
     # YTD ACTUAL MINUS BUDGET
     # ========================================================
 
-    df[
-        "YTD_Actual_Minus_Budget"
-    ] = (
-
-        df[
-            "YTD_Actual"
-        ]
-
+    df["YTD_Actual_Minus_Budget"] = (
+        df["YTD_Actual"]
         -
-
-        df[
-            "YTD_Budget"
-        ]
+        df["YTD_Budget"]
     )
 
 
     # ========================================================
-    # DIRECTION
+    # MOM DIRECTION
     # ========================================================
 
-    df[
-        "MoM_Direction"
-    ] = np.where(
+    df["MoM_Direction"] = np.where(
 
-        df[
-            "MoM_Change"
-        ].isna(),
+        df["MoM_Change"].isna(),
 
         "NO_PREVIOUS_MONTH",
 
         np.where(
 
-            df[
-                "MoM_Change"
-            ] > 0,
+            df["MoM_Change"] > 0,
 
             "INCREASE",
 
             np.where(
 
-                df[
-                    "MoM_Change"
-                ] < 0,
+                df["MoM_Change"] < 0,
 
                 "DECREASE",
 
@@ -846,53 +747,29 @@ def add_comparisons(df):
 
 
     # ========================================================
-    # MATERIALITY INPUTS
+    # ABSOLUTE MOVEMENTS
     # ========================================================
 
-    df[
-        "Abs_MoM_Change"
-    ] = (
-
-        df[
-            "MoM_Change"
-        ]
-
+    df["Abs_MoM_Change"] = (
+        df["MoM_Change"]
         .abs()
     )
 
 
-    df[
-        "Abs_Budget_Variance"
-    ] = (
-
-        df[
-            "Periodic_Vs_Budget"
-        ]
-
+    df["Abs_Budget_Variance"] = (
+        df["Periodic_Vs_Budget"]
         .abs()
     )
 
 
-    df[
-        "Abs_YoY_Change"
-    ] = (
-
-        df[
-            "Periodic_YoY_Abs"
-        ]
-
+    df["Abs_YoY_Change"] = (
+        df["Periodic_YoY_Abs"]
         .abs()
     )
 
 
-    df[
-        "Abs_YTD_Budget_Variance"
-    ] = (
-
-        df[
-            "YTD_Vs_Budget"
-        ]
-
+    df["Abs_YTD_Budget_Variance"] = (
+        df["YTD_Vs_Budget"]
         .abs()
     )
 
@@ -900,44 +777,20 @@ def add_comparisons(df):
     # ========================================================
     # MATERIALITY SCORE
     # ========================================================
-    #
-    # Still purely numerical.
-    #
-    # Gemini does NOT decide which movement is material.
-    #
-    # We use:
-    #
-    # MoM
-    # +
-    # Periodic Budget Variance
-    # +
-    # YoY
-    #
-    # YTD is kept separately because otherwise
-    # cumulative values can dominate every ranking.
-    # ========================================================
 
-    df[
-        "Materiality_Score"
-    ] = (
+    df["Materiality_Score"] = (
 
-        df[
-            "Abs_MoM_Change"
-        ]
+        df["Abs_MoM_Change"]
         .fillna(0)
 
         +
 
-        df[
-            "Abs_Budget_Variance"
-        ]
+        df["Abs_Budget_Variance"]
         .fillna(0)
 
         +
 
-        df[
-            "Abs_YoY_Change"
-        ]
+        df["Abs_YoY_Change"]
         .fillna(0)
     )
 
@@ -952,25 +805,16 @@ def add_comparisons(df):
 def validate_grain(df):
 
     duplicate_count = (
-
         df
-
         .duplicated(
-
             subset=[
-
                 "Fiscal_Year",
-
                 "Month",
-
                 "Entity_CD",
-
-                "Currency_Key",
-
+                "Currency",
                 "Account_CD",
             ]
         )
-
         .sum()
     )
 
@@ -999,14 +843,16 @@ def validate_grain(df):
     )
 
 
-    if duplicate_count > 0:
+    if duplicate_count == 0:
 
         print(
-            "\nWARNING:"
+            "PASS: No duplicates at the expected grain."
         )
 
+    else:
+
         print(
-            "Duplicates exist at the new Currency-aware grain."
+            "WARNING: Duplicate rows exist."
         )
 
 
@@ -1025,37 +871,30 @@ def validate_currency(df):
     )
 
 
-    currency_summary = (
-
+    mapping = (
         df[
             [
-
-                "Currency_Key",
-
+                "Currency_CD_Raw",
                 "Currency",
-
-                "Currency_CD",
             ]
         ]
-
         .drop_duplicates()
-
         .sort_values(
-            "Currency_Key"
+            "Currency"
         )
     )
 
 
     print(
-        currency_summary.to_string(
+        mapping.to_string(
             index=False
         )
     )
 
 
     print(
-        f"\nDistinct Currency Keys: "
-        f"{df['Currency_Key'].nunique()}"
+        f"\nDistinct mapped currencies: "
+        f"{df['Currency'].nunique()}"
     )
 
 
@@ -1065,53 +904,71 @@ def validate_currency(df):
 
 
     print(
-
-        df[
-            "Currency_Key"
-        ]
-
+        df["Currency"]
         .value_counts()
-
         .to_string()
     )
 
 
+    currencies = set(
+        df["Currency"]
+        .dropna()
+        .unique()
+    )
+
+
+    expected = {
+        "EUR",
+        "LC",
+    }
+
+
+    if currencies == expected:
+
+        print(
+            "\nPASS: Currency mapping contains EUR and LC."
+        )
+
+    else:
+
+        print(
+            "\nWARNING:"
+        )
+
+        print(
+            f"Expected currencies: {expected}"
+        )
+
+        print(
+            f"Found currencies: {currencies}"
+        )
+
+
 # ============================================================
-# CURRENCY / ENTITY EXAMPLE
+# SHOW EUR / LC SAMPLE
 # ============================================================
 
-def print_currency_example(df):
+def print_currency_sample(df):
 
-    counts = (
-
+    entity_currency_counts = (
         df[
             [
-
                 "Entity_CD",
-
                 "Entity_Name",
-
-                "Currency_Key",
+                "Currency",
             ]
         ]
-
         .drop_duplicates()
-
         .groupby(
             [
                 "Entity_CD",
                 "Entity_Name",
             ]
-        )[
-            "Currency_Key"
-        ]
-
+        )["Currency"]
         .nunique()
-
         .reset_index(
             name="Currency_Count"
         )
-
         .sort_values(
             "Currency_Count",
             ascending=False,
@@ -1119,89 +976,75 @@ def print_currency_example(df):
     )
 
 
-    multiple_currency = counts[
-
-        counts[
+    candidates = entity_currency_counts[
+        entity_currency_counts[
             "Currency_Count"
-        ] > 1
-
+        ] >= 2
     ]
 
 
-    if multiple_currency.empty:
+    if candidates.empty:
 
         print(
-            "\nNo entity with multiple currencies "
-            "was found in this dataset."
+            "\nNo entity with both EUR and LC "
+            "was found."
         )
 
         return
 
 
     entity_cd = (
-
-        multiple_currency[
+        candidates.iloc[0][
             "Entity_CD"
-        ].iloc[0]
+        ]
     )
 
 
     entity_name = (
-
-        multiple_currency[
+        candidates.iloc[0][
             "Entity_Name"
-        ].iloc[0]
+        ]
     )
 
 
     sample = (
-
         df[
-
-            df[
-                "Entity_CD"
-            ]
-            == entity_cd
-
+            df["Entity_CD"]
+            ==
+            entity_cd
         ]
-
         [
             [
-
                 "Entity_Name",
-
                 "Month",
-
-                "Currency_Key",
-
+                "Currency",
+                "Currency_CD_Raw",
                 "Account_Name",
-
                 "Periodic_Actual",
-
                 "Previous_Periodic_Actual",
-
                 "MoM_Change",
+                "MoM_Pct",
             ]
         ]
-
         .sort_values(
-
             [
-
-                "Currency_Key",
-
                 "Account_Name",
-
+                "Currency",
+                "Month_Order"
+            ]
+            if "Month_Order" in df.columns
+            else
+            [
+                "Account_Name",
+                "Currency",
                 "Month",
             ]
         )
-
-        .head(30)
     )
 
 
     print(
-        "\nMULTI-CURRENCY SAMPLE"
+        "\nEUR / LC VALIDATION SAMPLE"
     )
 
     print(
@@ -1210,13 +1053,13 @@ def print_currency_example(df):
 
 
     print(
-        f"Entity: "
-        f"{entity_name}"
+        f"Entity: {entity_name}"
     )
 
 
     print(
-        sample.to_string(
+        sample.head(40)
+        .to_string(
             index=False
         )
     )
@@ -1233,7 +1076,7 @@ def main():
     )
 
     print(
-        "BUILDING CURRENCY-AWARE PAGE-1 ENRICHED ANALYSIS"
+        "PAGE-1 CURRENCY-AWARE ENRICHED ANALYSIS"
     )
 
     print(
@@ -1242,26 +1085,17 @@ def main():
 
 
     # ========================================================
-    # LOAD ACCOUNT MAPPING
+    # ACCOUNT MAPPING
     # ========================================================
 
-    mapping_df = (
-        load_mapping()
-    )
+    mapping_df = load_mapping()
 
 
     account_codes = (
-
-        mapping_df[
-            "Account_CD"
-        ]
-
+        mapping_df["Account_CD"]
         .dropna()
-
         .astype(str)
-
         .str.strip()
-
         .tolist()
     )
 
@@ -1273,7 +1107,7 @@ def main():
 
 
     # ========================================================
-    # BIGQUERY CLIENT
+    # BIGQUERY
     # ========================================================
 
     client = bigquery.Client(
@@ -1281,10 +1115,8 @@ def main():
     )
 
 
-    latest_year = (
-        get_latest_year(
-            client
-        )
+    latest_year = get_latest_year(
+        client
     )
 
 
@@ -1308,23 +1140,17 @@ def main():
     # ========================================================
 
     print(
-        "\nExtracting Currency-aware Page-1 data..."
+        "\nExtracting Page-1 data..."
     )
 
 
     df = extract_page1_data(
 
-        client=
+        client=client,
 
-            client,
+        year=latest_year,
 
-        year=
-
-            latest_year,
-
-        account_codes=
-
-            account_codes,
+        account_codes=account_codes,
     )
 
 
@@ -1338,11 +1164,11 @@ def main():
 
 
     # ========================================================
-    # CALCULATIONS
+    # ADD COMPARISONS
     # ========================================================
 
     print(
-        "Building Currency-aware comparisons..."
+        "Building EUR / LC-aware comparisons..."
     )
 
 
@@ -1352,7 +1178,7 @@ def main():
 
 
     # ========================================================
-    # BASIC VALIDATION
+    # STATUS
     # ========================================================
 
     print(
@@ -1390,7 +1216,7 @@ def main():
 
     print(
         f"Currencies: "
-        f"{df['Currency_Key'].nunique()}"
+        f"{df['Currency'].nunique()}"
     )
 
 
@@ -1399,18 +1225,13 @@ def main():
     # ========================================================
 
     month_summary = (
-
         df[
             [
-
                 "Month_Order",
-
                 "Month",
             ]
         ]
-
         .drop_duplicates()
-
         .sort_values(
             "Month_Order"
         )
@@ -1423,18 +1244,15 @@ def main():
 
 
     print(
-
         ", ".join(
-
-            month_summary[
-                "Month"
-            ].tolist()
+            month_summary["Month"]
+            .tolist()
         )
     )
 
 
     # ========================================================
-    # VALIDATE
+    # VALIDATIONS
     # ========================================================
 
     validate_grain(
@@ -1447,7 +1265,7 @@ def main():
     )
 
 
-    print_currency_example(
+    print_currency_sample(
         df
     )
 
@@ -1457,30 +1275,28 @@ def main():
     # ========================================================
 
     OUTPUT_FILE.parent.mkdir(
-
         parents=True,
-
         exist_ok=True,
     )
 
 
     df.to_csv(
-
         OUTPUT_FILE,
-
         index=False,
     )
 
 
     print(
         "\n"
-        + "=" * 80
+        +
+        "=" * 80
     )
 
 
     print(
         "OUTPUT SAVED"
     )
+
 
     print(
         "=" * 80
@@ -1493,8 +1309,7 @@ def main():
 
 
     print(
-        "\nITERATION-2 CURRENCY-AWARE "
-        "ENRICHED ANALYSIS COMPLETED."
+        "\nITERATION-2 ENRICHED ANALYSIS COMPLETED."
     )
 
 
