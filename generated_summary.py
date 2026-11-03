@@ -1,10 +1,10 @@
 import argparse
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from google import genai
@@ -65,24 +65,13 @@ MAX_ATTEMPTS = 3
 
 RETRY_SLEEP_SECONDS = 2
 
-MAX_DISPLAY_MOM_PCT = 500
-
 
 # ============================================================
 # STRUCTURED OUTPUT SCHEMA
-#
-# IMPORTANT:
-# We use explicit fields instead of arrays.
-#
-# This is more reliable than asking Gemini for:
-#
-# executive_summary: [...]
-# key_movements: [...]
-#
-# Every successful response has the exact same structure.
 # ============================================================
 
 SUMMARY_SCHEMA = {
+
     "type": "object",
 
     "properties": {
@@ -166,10 +155,6 @@ SUMMARY_SCHEMA = {
 }
 
 
-# ============================================================
-# REQUIRED OUTPUT FIELDS
-# ============================================================
-
 OUTPUT_FIELDS = [
 
     "executive_point_1",
@@ -189,7 +174,86 @@ OUTPUT_FIELDS = [
 
 
 # ============================================================
-# GOOGLE GENAI CLIENT
+# WORDING THAT SHOULD NOT APPEAR
+#
+# These terms either imply unsupported business judgement
+# or unsupported causality.
+# ============================================================
+
+BANNED_PHRASES = [
+
+    "outperformed",
+
+    "underperformed",
+
+    "favorable",
+
+    "favourable",
+
+    "unfavorable",
+
+    "unfavourable",
+
+    "supported by",
+
+    "driven by",
+
+    "due to",
+
+    "caused by",
+
+    "helped by",
+
+    "benefited from",
+
+    "improvement of",
+
+    "deterioration of",
+
+    "strong performance",
+
+    "weak performance",
+
+    "healthy",
+
+    "concerning",
+
+    "revERSAL_UP",
+
+    "revERSAL_DOWN",
+
+    "CONSISTENT_INCREASE",
+
+    "CONSISTENT_DECREASE",
+]
+
+
+# ============================================================
+# MAX WORDS PER POINT
+#
+# Rich enough to explain the number, but still popup-friendly.
+# ============================================================
+
+MAX_WORDS = {
+
+    "executive_point_1": 42,
+    "executive_point_2": 42,
+
+    "key_movement_1": 34,
+    "key_movement_2": 34,
+    "key_movement_3": 34,
+    "key_movement_4": 34,
+
+    "trend_point_1": 38,
+    "trend_point_2": 38,
+
+    "budget_ytd_point_1": 38,
+    "budget_ytd_point_2": 38,
+}
+
+
+# ============================================================
+# GENAI CLIENT
 # ============================================================
 
 def create_client():
@@ -202,7 +266,7 @@ def create_client():
 
 
 # ============================================================
-# UTILITIES
+# GENERAL UTILITIES
 # ============================================================
 
 def is_missing(value):
@@ -240,19 +304,22 @@ def safe_float(value):
         return None
 
 
+def rounded_rank(value):
+
+    value = safe_float(
+        value
+    )
+
+    if value is None:
+        return None
+
+    return int(
+        round(value)
+    )
+
+
 # ============================================================
-# CONVERT CASH VALUES TO MILLIONS
-#
-# The raw CF table contains full currency values.
-#
-# Example:
-# 638,876,900
-#
-# becomes:
-# 638.88
-#
-# Gemini is explicitly told that these numbers are millions
-# of the selected currency.
+# MONEY
 # ============================================================
 
 def to_millions(value):
@@ -270,40 +337,84 @@ def to_millions(value):
     )
 
 
-def rounded_pct(value):
+# ============================================================
+# SAFE PERCENTAGE
+#
+# IMPORTANT ITERATION-2 RULE
+#
+# Percentages on negative bases or sign-crossing movements can
+# be highly misleading.
+#
+# Example:
+#
+# -100 → +50
+#
+# should NOT be described as +150%.
+#
+# Instead:
+#
+# "moved from -100m to +50m, a 150m swing."
+#
+# Therefore MoM percentage is only supplied to Gemini when:
+#
+# previous > 0
+# AND
+# current > 0
+#
+# ============================================================
 
-    value = safe_float(
-        value
+def safe_positive_base_pct(
+    percentage,
+    current,
+    previous,
+):
+
+    percentage = safe_float(
+        percentage
     )
 
-    if value is None:
+    current = safe_float(
+        current
+    )
+
+    previous = safe_float(
+        previous
+    )
+
+
+    if percentage is None:
         return None
 
-    if abs(value) > MAX_DISPLAY_MOM_PCT:
+    if current is None:
         return None
+
+    if previous is None:
+        return None
+
+
+    if previous <= 0:
+        return None
+
+
+    if current <= 0:
+        return None
+
+
+    if abs(
+        percentage
+    ) > 500:
+
+        return None
+
 
     return round(
-        value,
+        percentage,
         2,
     )
 
 
-def rounded_rank(value):
-
-    value = safe_float(
-        value
-    )
-
-    if value is None:
-        return None
-
-    return int(
-        round(value)
-    )
-
-
 # ============================================================
-# READ INPUTS
+# LOAD INPUTS
 # ============================================================
 
 def load_inputs():
@@ -342,12 +453,13 @@ def load_inputs():
     )
 
 
-    string_columns = [
+    insight_strings = [
 
         "Entity_CD",
         "Entity_Name",
         "Currency",
         "Selected_Month",
+
         "Section",
         "Metric",
         "Account_CD",
@@ -355,7 +467,7 @@ def load_inputs():
     ]
 
 
-    for column in string_columns:
+    for column in insight_strings:
 
         if column in insight_df.columns:
 
@@ -367,12 +479,13 @@ def load_inputs():
             )
 
 
-    trend_string_columns = [
+    trend_strings = [
 
         "Entity_CD",
         "Entity_Name",
         "Currency",
         "Selected_Month",
+
         "Metric_Type",
         "Metric",
         "Account_CD",
@@ -381,7 +494,7 @@ def load_inputs():
     ]
 
 
-    for column in trend_string_columns:
+    for column in trend_strings:
 
         if column in trend_df.columns:
 
@@ -404,6 +517,64 @@ def load_inputs():
 # ============================================================
 
 def build_current_fact(row):
+
+    actual_raw = safe_float(
+        row.get(
+            "Actual"
+        )
+    )
+
+    previous_raw = safe_float(
+        row.get(
+            "Previous_Actual"
+        )
+    )
+
+
+    mom_pct = safe_positive_base_pct(
+
+        percentage=
+            row.get(
+                "MoM_Pct_Safe"
+            ),
+
+        current=
+            actual_raw,
+
+        previous=
+            previous_raw,
+    )
+
+
+    # ========================================================
+    # CHANGE FROM FIRST MONTH %
+    #
+    # Same conservative percentage rule.
+    # ========================================================
+
+    first_actual_raw = safe_float(
+        row.get(
+            "First_Actual"
+        )
+    )
+
+
+    change_from_first_pct = (
+        safe_positive_base_pct(
+
+            percentage=
+                row.get(
+                    "Change_From_First_Pct"
+                ),
+
+            current=
+                actual_raw,
+
+            previous=
+                first_actual_raw,
+        )
+    )
+
 
     fact = {
 
@@ -435,15 +606,14 @@ def build_current_fact(row):
                 )
             ),
 
-        # ==============================================
+
+        # ====================================================
         # CURRENT MONTH
-        # ==============================================
+        # ====================================================
 
         "actual_m":
             to_millions(
-                row.get(
-                    "Actual"
-                )
+                actual_raw
             ),
 
         "previous_month":
@@ -455,9 +625,7 @@ def build_current_fact(row):
 
         "previous_actual_m":
             to_millions(
-                row.get(
-                    "Previous_Actual"
-                )
+                previous_raw
             ),
 
         "mom_change_m":
@@ -468,11 +636,7 @@ def build_current_fact(row):
             ),
 
         "mom_pct":
-            rounded_pct(
-                row.get(
-                    "MoM_Pct_Safe"
-                )
-            ),
+            mom_pct,
 
         "mom_direction":
             clean_string(
@@ -481,9 +645,10 @@ def build_current_fact(row):
                 )
             ),
 
-        # ==============================================
+
+        # ====================================================
         # BUDGET
-        # ==============================================
+        # ====================================================
 
         "budget_m":
             to_millions(
@@ -506,9 +671,10 @@ def build_current_fact(row):
                 )
             ),
 
-        # ==============================================
+
+        # ====================================================
         # YOY
-        # ==============================================
+        # ====================================================
 
         "yoy_change_m":
             to_millions(
@@ -517,9 +683,10 @@ def build_current_fact(row):
                 )
             ),
 
-        # ==============================================
+
+        # ====================================================
         # YTD
-        # ==============================================
+        # ====================================================
 
         "ytd_actual_m":
             to_millions(
@@ -556,9 +723,10 @@ def build_current_fact(row):
                 )
             ),
 
-        # ==============================================
-        # MULTI-MONTH ANALYSIS
-        # ==============================================
+
+        # ====================================================
+        # MULTI-MONTH COMPARISONS
+        # ====================================================
 
         "two_months_ago_actual_m":
             to_millions(
@@ -588,9 +756,10 @@ def build_current_fact(row):
                 )
             ),
 
-        # ==============================================
-        # TREND CONTEXT
-        # ==============================================
+
+        # ====================================================
+        # HISTORY
+        # ====================================================
 
         "history_months":
             rounded_rank(
@@ -608,9 +777,7 @@ def build_current_fact(row):
 
         "first_actual_m":
             to_millions(
-                row.get(
-                    "First_Actual"
-                )
+                first_actual_raw
             ),
 
         "change_from_first_m":
@@ -621,11 +788,7 @@ def build_current_fact(row):
             ),
 
         "change_from_first_pct":
-            rounded_pct(
-                row.get(
-                    "Change_From_First_Pct"
-                )
-            ),
+            change_from_first_pct,
 
         "peak_month":
             clean_string(
@@ -676,9 +839,10 @@ def build_current_fact(row):
                 )
             ),
 
-        # ==============================================
-        # IMPORTANCE
-        # ==============================================
+
+        # ====================================================
+        # RANKS
+        # ====================================================
 
         "materiality_rank":
             rounded_rank(
@@ -703,19 +867,25 @@ def build_current_fact(row):
     }
 
 
-    # Remove only None values.
+    # ========================================================
+    # REMOVE NONE
     #
-    # Keep zero because zero is meaningful financial data.
+    # Zero stays because zero is meaningful.
+    # ========================================================
 
     return {
+
         key: value
-        for key, value in fact.items()
+
+        for key, value
+        in fact.items()
+
         if value is not None
     }
 
 
 # ============================================================
-# BUILD TREND FACTS
+# BUILD TREND HISTORY
 # ============================================================
 
 def build_trend_facts(
@@ -746,12 +916,12 @@ def build_trend_facts(
         )
 
 
-        monthly_history = []
+        history = []
 
 
         for _, row in group.iterrows():
 
-            monthly_history.append(
+            history.append(
                 {
 
                     "month":
@@ -799,7 +969,7 @@ def build_trend_facts(
                     ),
 
                 "history":
-                    monthly_history,
+                    history,
             }
         )
 
@@ -808,7 +978,7 @@ def build_trend_facts(
 
 
 # ============================================================
-# BUILD COMPLETE FACT PACKAGE
+# BUILD FACT PACKAGE
 # ============================================================
 
 def build_fact_package(
@@ -818,6 +988,10 @@ def build_fact_package(
 
     first = insight_subset.iloc[0]
 
+
+    # ========================================================
+    # HEADLINES
+    # ========================================================
 
     headline_df = (
         insight_subset[
@@ -830,8 +1004,16 @@ def build_fact_package(
         .sort_values(
             "Rank"
         )
+        .copy()
     )
 
+
+    # ========================================================
+    # DRIVERS
+    #
+    # Exactly four from Step 2.
+    # Their order is materiality rank 1 → 4.
+    # ========================================================
 
     driver_df = (
         insight_subset[
@@ -844,6 +1026,7 @@ def build_fact_package(
         .sort_values(
             "Rank"
         )
+        .copy()
     )
 
 
@@ -853,9 +1036,8 @@ def build_fact_package(
             row
         )
 
-        for _, row in (
-            headline_df.iterrows()
-        )
+        for _, row
+        in headline_df.iterrows()
     ]
 
 
@@ -865,20 +1047,12 @@ def build_fact_package(
             row
         )
 
-        for _, row in (
-            driver_df.iterrows()
-        )
+        for _, row
+        in driver_df.iterrows()
     ]
 
 
-    trend_facts = (
-        build_trend_facts(
-            trend_subset
-        )
-    )
-
-
-    package = {
+    return {
 
         "context": {
 
@@ -918,24 +1092,23 @@ def build_fact_package(
                 ),
 
             "amount_unit":
-                (
-                    "millions of the selected "
-                    "currency"
-                ),
+                "millions",
         },
+
 
         "headline_kpis":
             headline_facts,
 
+
         "top_4_material_drivers":
             driver_facts,
 
+
         "historical_monthly_values":
-            trend_facts,
+            build_trend_facts(
+                trend_subset
+            ),
     }
-
-
-    return package
 
 
 # ============================================================
@@ -947,14 +1120,11 @@ def build_prompt(
     retry_note="",
 ):
 
-    context = fact_package[
-        "context"
-    ]
-
-
-    currency = context[
-        "currency"
-    ]
+    context = (
+        fact_package[
+            "context"
+        ]
+    )
 
 
     retry_section = ""
@@ -964,231 +1134,386 @@ def build_prompt(
 
         retry_section = f"""
 
-PREVIOUS ATTEMPT ISSUE
-----------------------
+============================================================
+PREVIOUS ATTEMPT DID NOT PASS QUALITY VALIDATION
+============================================================
+
 {retry_note}
 
-Correct that issue in this attempt.
+Correct those issues in this attempt.
 """
 
 
-    prompt = f"""
-You are an executive cash-flow analyst.
-
-You are writing AI commentary for an SAP Analytics Cloud
-cash-flow dashboard.
+    return f"""
+You are an executive cash-flow analyst writing commentary for an
+SAP Analytics Cloud cash-flow dashboard.
 
 Selected context:
 
 Fiscal Year: {context['fiscal_year']}
 Month: {context['month']}
 Entity: {context['entity']}
-Currency: {currency}
+Currency: {context['currency']}
 
-All monetary numbers supplied below are already expressed in
-MILLIONS of the selected currency.
+All monetary values supplied below are already in MILLIONS of the
+selected dashboard currency.
 
 For EUR:
-write monetary amounts as "EUR 25.4m".
+write amounts such as EUR 125.4m.
 
 For LC:
-write monetary amounts as "LC 25.4m".
+write amounts such as LC 125.4m.
 
-Do not convert between currencies.
-
-
-============================================================
-OBJECTIVE
-============================================================
-
-Create concise but genuinely insightful executive commentary.
-
-A reader opening the popup should understand:
-
-1. What materially happened in the selected month.
-2. Which headline KPIs changed the most or matter most.
-3. Which underlying supplied drivers were significant.
-4. Whether the latest month continues or reverses a trend.
-5. How performance compares with monthly budget.
-6. How the year-to-date position compares with budget.
-7. Relevant YoY context where supplied.
+Never convert between EUR and LC.
 
 
 ============================================================
-VERY IMPORTANT WRITING STANDARD
+THE PURPOSE OF THIS COMMENTARY
 ============================================================
 
-Do NOT merely restate one number per sentence.
+When an executive opens the popup, they should understand the
+financial story of the selected month without having to interpret
+every dashboard chart manually.
 
-Weak:
-"EBITDA decreased by 3.6%."
+The commentary must explain:
 
-Better:
-"EBITDA declined 3.6% MoM to EUR 113.7m, extending the recent
-downward direction while remaining EUR 8.2m below budget."
-
-The better sentence combines multiple supported facts.
-
-Look for meaningful relationships across the supplied facts.
-
-Examples of useful relationships:
-
-- current month versus previous month
-- current value versus budget
-- YTD value versus YTD budget
-- current month versus available FY history
-- reversal after previous increases/decreases
-- consecutive monthly movements
-- latest value being the highest or lowest in available history
-- headline movement occurring alongside a material component movement
-- divergence between two headline KPIs
-- strongest material driver among the supplied drivers
-
-However, correlation is NOT causation.
-
-You may say:
-
-"Working Capital declined while WC Receivables also moved lower."
-
-Do NOT say:
-
-"WC Receivables caused the Working Capital decline"
-
-unless that causal relationship is explicitly established by the
-supplied data.
+1. What materially changed.
+2. Which headline cash-flow measures matter most.
+3. Which underlying cash-flow drivers moved materially.
+4. Whether the latest result continues or reverses recent history.
+5. How the selected month compares with budget.
+6. How the cumulative YTD position compares with budget.
+7. Relevant YoY context when available.
 
 
 ============================================================
-SECTION REQUIREMENTS
+WHAT "INSIGHTFUL" MEANS
 ============================================================
 
-EXECUTIVE POINTS — 2
+Do not simply write:
 
-These are the two most important takeaways.
+"EBITDA increased 3.5%."
 
-Each executive point should usually combine 2 or more relevant facts.
+Instead connect supported facts:
 
-Do not repeat the same fact in both points.
+"EBITDA increased 3.5% MoM to EUR 145.2m, but remained
+EUR 11.6m below the September budget."
 
+Another good form:
 
-KEY MOVEMENTS — 4
+"Free Cash Flow fell to EUR 87.3m from EUR 163.5m in August,
+reversing the previous month's increase while remaining above its
+YTD budget position."
 
-Use the supplied Top 4 material drivers and/or important headline
-movements.
-
-Explain why each movement stands out numerically.
-
-Use comparisons such as MoM, budget, ranking, or historical position
-when available.
-
-Avoid four repetitive sentences with identical structure.
+Every point should ideally connect two or more relevant facts when
+the data allows it.
 
 
-TREND POINTS — 2
+============================================================
+IMPORTANT PERCENTAGE RULE
+============================================================
 
-Describe meaningful multi-month patterns.
+Use MoM percentage ONLY when the field "mom_pct" is supplied.
 
-Use facts such as:
+If "mom_pct" is missing, DO NOT calculate one yourself.
 
-CONSISTENT_INCREASE
-CONSISTENT_DECREASE
-REVERSAL_UP
-REVERSAL_DOWN
-MIXED
+It has deliberately been removed when:
 
-Also use peak/low month and consecutive movements where useful.
+- the previous value was zero
+- the previous value was negative
+- the current value was negative
+- the movement crossed zero
+- the percentage would otherwise be misleading
 
-If this is the first available month and a trend cannot be established,
-state that clearly rather than inventing a trend.
-
-Do not predict future performance.
-
-
-BUDGET & YTD POINTS — 2
-
-Focus on:
-
-monthly budget position
-+
-year-to-date budget position
-
-Where useful, contrast monthly performance with cumulative YTD
-performance.
+In those situations describe the movement using values and
+absolute change.
 
 Example:
 
-"Although September FCF finished above monthly budget, YTD FCF
-remains below plan."
+Previous = LC -866.7m
+Current  = LC 1,803.8m
 
-Only make such a statement if the supplied facts support it.
+Correct:
 
+"WC Receivables moved from LC -866.7m to LC 1,803.8m,
+a LC 2,670.5m swing."
 
-============================================================
-STRICT FACTUAL RULES
-============================================================
+Incorrect:
 
-Use ONLY the supplied data.
-
-Never invent:
-
-- causes
-- operational explanations
-- management actions
-- forecasts
-- missing numbers
-- business events
-
-Do not call a movement favourable, unfavourable, strong, weak,
-healthy, poor, or concerning solely because the number increased
-or decreased.
-
-For example, a more negative cash-flow line is not automatically
-bad unless the supplied business context proves that interpretation.
-
-Use neutral language when business meaning is uncertain:
-
-- increased
-- decreased
-- moved higher
-- moved lower
-- above budget
-- below budget
-- reversed
-- remained stable
-- widened
-- narrowed
+"WC Receivables increased 308%."
 
 
 ============================================================
-NUMERIC RULES
+EXECUTIVE SUMMARY — EXACTLY 2 POINTS
 ============================================================
 
-Round monetary values sensibly, normally to 1 or 2 decimals.
+These should be the two most important overall conclusions.
 
-Do not calculate a MoM percentage when "mom_pct" is absent.
+Use HEADLINE KPIs.
 
-When a supplied percentage is absent because the prior-period base
-was near zero, describe the absolute movement instead.
+Each point should normally combine multiple supported facts such as:
 
-Do not invent percentages from the raw values.
+- MoM direction
+- actual value
+- budget position
+- recent trend
+- another headline KPI where useful
 
-Do not mix EUR and LC.
+Do not simply copy one Key Movement.
 
-All facts in this request belong only to:
-{context['entity']} | {context['month']} | {currency}
+Aim for approximately 25–38 words per point.
+
+
+============================================================
+KEY MOVEMENTS — EXACTLY 4 POINTS
+============================================================
+
+THIS RULE IS STRICT:
+
+There are exactly four objects under:
+
+"top_4_material_drivers"
+
+Key Movement 1 must discuss DRIVER rank 1.
+Key Movement 2 must discuss DRIVER rank 2.
+Key Movement 3 must discuss DRIVER rank 3.
+Key Movement 4 must discuss DRIVER rank 4.
+
+Do NOT replace a driver with EBITDA, FCF, OFCF, Working Capital,
+Capital Additions, or another headline KPI.
+
+The purpose of this section is to explain the underlying movements
+that sit beneath the headline view.
+
+For each driver, explain why it stands out using available evidence:
+
+- absolute MoM movement
+- current versus previous value
+- budget position
+- historical high/low
+- reversal
+- consecutive movement
+- materiality ranking
+
+Do not claim that a driver CAUSED a headline movement.
+
+Aim for approximately 18–30 words per point.
+
+
+============================================================
+TREND INSIGHT — EXACTLY 2 POINTS
+============================================================
+
+Translate technical trend labels into natural financial language.
+
+Examples:
+
+REVERSAL_UP
+
+should become:
+
+"reversed upward in September after declining in August"
+
+NOT:
+
+"REVERSAL_UP"
+
+
+REVERSAL_DOWN
+
+should become:
+
+"reversed lower in September after increasing in August"
+
+
+CONSISTENT_INCREASE
+
+should become:
+
+"has increased across each available monthly observation"
+
+
+CONSISTENT_DECREASE
+
+should become:
+
+"has declined across each available monthly observation"
+
+
+Use:
+
+- multi-month history
+- consecutive movement count
+- peak month
+- lowest month
+- change from first available month
+- reversals
+
+Do not predict future performance.
+
+If this is the first available month, state that there is insufficient
+history rather than inventing a trend.
+
+Aim for approximately 20–32 words per point.
+
+
+============================================================
+BUDGET & YTD — EXACTLY 2 POINTS
+============================================================
+
+Explain monthly budget position and cumulative YTD position.
+
+Look especially for contrasts such as:
+
+- current month below budget but YTD above budget
+- current month above budget but YTD below budget
+- both monthly and YTD below budget
+- both monthly and YTD above budget
+
+Use neutral mathematical wording:
+
+"above budget"
+"below budget"
+"on budget"
+
+Do NOT use:
+
+"outperformed"
+"underperformed"
+"favorable"
+"unfavorable"
+"strong"
+"weak"
+
+Aim for approximately 20–32 words per point.
+
+
+============================================================
+CAUSALITY RULE — VERY IMPORTANT
+============================================================
+
+You have numerical relationships, not operational causal evidence.
+
+Never write:
+
+"X was driven by Y"
+"X was supported by Y"
+"X improved due to Y"
+"Y caused X"
+"X benefited from Y"
+
+unless explicit causal information is supplied.
+
+Instead use:
+
+"while"
+"alongside"
+"at the same time"
+"the same month also saw"
+"coincided with"
+
+Example:
+
+Correct:
+
+"Working Capital moved lower while WC Receivables also recorded
+a material decline."
+
+Incorrect:
+
+"Working Capital declined due to WC Receivables."
+
+
+============================================================
+BUSINESS-JUDGEMENT RULE
+============================================================
+
+Do not assume that increasing or decreasing is automatically good
+or bad.
+
+Do not use terms such as:
+
+favorable
+unfavorable
+healthy
+poor
+concerning
+strong performance
+weak performance
+improvement
+deterioration
+
+unless the supplied data explicitly establishes that interpretation.
+
+Prefer descriptive language:
+
+increased
+decreased
+moved higher
+moved lower
+reversed upward
+reversed lower
+above budget
+below budget
+widened
+narrowed
+remained stable
 
 
 ============================================================
 ANTI-REPETITION RULE
 ============================================================
 
-Each of the 10 points must add new information.
+The popup contains 10 points.
 
-A number may appear again only when needed to connect a different
-insight.
+Each point must add information.
 
-Do not repeat the exact same observation in Executive Summary,
-Key Movements, Trend, and Budget/YTD.
+Do not use all sections to repeat:
+
+"FCF decreased by X."
+
+Executive Summary:
+overall conclusion.
+
+Key Movements:
+underlying four drivers.
+
+Trend:
+historical pattern.
+
+Budget & YTD:
+plan/cumulative position.
+
+These sections should complement each other.
+
+
+============================================================
+FACTUAL RULES
+============================================================
+
+Use ONLY facts provided below.
+
+Never invent:
+
+- operational causes
+- market explanations
+- management actions
+- future forecasts
+- missing numbers
+- missing percentages
+- business events
+
+Do not mix entities.
+
+Do not mix months.
+
+Do not mix EUR and LC.
+
+All commentary must refer only to:
+
+{context['entity']}
+{context['month']}
+{context['currency']}
 
 
 ============================================================
@@ -1201,24 +1526,20 @@ FACT PACKAGE
     ensure_ascii=False,
     allow_nan=False,
 )}
+
 {retry_section}
-"""
 
-
-    return prompt.strip()
+Return only the structured response required by the supplied schema.
+""".strip()
 
 
 # ============================================================
-# PARSE GEMINI RESPONSE
+# PARSE RESPONSE
 # ============================================================
 
 def parse_response(
     response,
 ):
-
-    # ========================================================
-    # FIRST: SDK-parsed structured response
-    # ========================================================
 
     parsed = getattr(
         response,
@@ -1245,10 +1566,6 @@ def parse_response(
             return parsed.model_dump()
 
 
-    # ========================================================
-    # FALLBACK: response.text
-    # ========================================================
-
     text = clean_string(
         getattr(
             response,
@@ -1261,24 +1578,26 @@ def parse_response(
     if not text:
 
         raise ValueError(
-            "Gemini returned empty response text."
+            "Gemini returned empty response."
         )
 
-
-    # Defensive cleanup in case fences appear despite
-    # structured-output mode.
 
     if text.startswith(
         "```"
     ):
 
-        text = text.strip("`")
+        text = text.strip(
+            "`"
+        )
+
 
         if text.lower().startswith(
             "json"
         ):
 
-            text = text[4:].strip()
+            text = text[
+                4:
+            ].strip()
 
 
     return json.loads(
@@ -1287,7 +1606,21 @@ def parse_response(
 
 
 # ============================================================
-# VALIDATE STRUCTURED RESPONSE
+# WORD COUNT
+# ============================================================
+
+def word_count(text):
+
+    return len(
+        re.findall(
+            r"\b[\w€.-]+\b",
+            text,
+        )
+    )
+
+
+# ============================================================
+# QUALITY VALIDATION
 # ============================================================
 
 def validate_result(
@@ -1301,9 +1634,13 @@ def validate_result(
     ):
 
         raise ValueError(
-            "Structured response is not a JSON object."
+            "Response is not a JSON object."
         )
 
+
+    # ========================================================
+    # REQUIRED FIELDS
+    # ========================================================
 
     missing = [
 
@@ -1318,7 +1655,7 @@ def validate_result(
     if missing:
 
         raise ValueError(
-            "Missing output fields: "
+            "Missing fields: "
             +
             ", ".join(
                 missing
@@ -1326,46 +1663,28 @@ def validate_result(
         )
 
 
-    cleaned = {}
+    cleaned = {
 
-
-    for field in OUTPUT_FIELDS:
-
-        value = clean_string(
-            result.get(
-                field
+        field:
+            clean_string(
+                result.get(
+                    field
+                )
             )
-        )
 
-        cleaned[
-            field
-        ] = value
+        for field in OUTPUT_FIELDS
+    }
 
 
     # ========================================================
-    # CORE POINTS MUST ALWAYS EXIST
+    # NON-EMPTY
     # ========================================================
 
-    mandatory_non_empty = [
-
-        "executive_point_1",
-        "executive_point_2",
-
-        "key_movement_1",
-        "key_movement_2",
-        "key_movement_3",
-        "key_movement_4",
-
-        "budget_ytd_point_1",
-        "budget_ytd_point_2",
-    ]
-
-
-    empty_mandatory = [
+    empty_fields = [
 
         field
 
-        for field in mandatory_non_empty
+        for field in OUTPUT_FIELDS
 
         if not cleaned[
             field
@@ -1373,59 +1692,96 @@ def validate_result(
     ]
 
 
-    if empty_mandatory:
+    # April has limited history.
+    #
+    # Still require the model to explain that rather than
+    # leaving blank.
+
+    if empty_fields:
 
         raise ValueError(
-            "Empty required commentary fields: "
+            "Empty commentary fields: "
             +
             ", ".join(
-                empty_mandatory
+                empty_fields
             )
         )
 
 
     # ========================================================
-    # TREND
-    #
-    # From May onward, require both trend points.
-    #
-    # April is first available month, so one trend point can
-    # legitimately explain that history is insufficient.
+    # BANNED LANGUAGE
     # ========================================================
 
-    if selected_month_order > 1:
+    combined_text = " ".join(
+        cleaned.values()
+    ).lower()
 
-        if not cleaned[
-            "trend_point_1"
-        ]:
 
-            raise ValueError(
-                "Trend point 1 is empty."
+    bad_terms = []
+
+
+    for phrase in BANNED_PHRASES:
+
+        if (
+            phrase.lower()
+            in combined_text
+        ):
+
+            bad_terms.append(
+                phrase
             )
 
 
-        if not cleaned[
-            "trend_point_2"
-        ]:
+    if bad_terms:
 
-            raise ValueError(
-                "Trend point 2 is empty."
+        raise ValueError(
+            "Unsupported or technical wording found: "
+            +
+            ", ".join(
+                bad_terms
+            )
+        )
+
+
+    # ========================================================
+    # POINT LENGTH
+    # ========================================================
+
+    too_long = []
+
+
+    for field, text in (
+        cleaned.items()
+    ):
+
+        count = word_count(
+            text
+        )
+
+
+        maximum = MAX_WORDS[
+            field
+        ]
+
+
+        if count > maximum:
+
+            too_long.append(
+                f"{field}="
+                f"{count} words "
+                f"(max {maximum})"
             )
 
 
-    else:
+    if too_long:
 
-        if not cleaned[
-            "trend_point_1"
-        ]:
-
-            cleaned[
-                "trend_point_1"
-            ] = (
-                "This is the first available month in the "
-                "current fiscal-year history, so a monthly "
-                "trend cannot yet be established."
+        raise ValueError(
+            "Points are too long: "
+            +
+            "; ".join(
+                too_long
             )
+        )
 
 
     return cleaned
@@ -1454,61 +1810,76 @@ def generate_one_summary(
         try:
 
             prompt = build_prompt(
-                fact_package=fact_package,
-                retry_note=last_error,
+
+                fact_package=
+                    fact_package,
+
+                retry_note=
+                    last_error,
             )
 
 
             response = (
                 client.models.generate_content(
 
-                    model=GEMINI_MODEL,
+                    model=
+                        GEMINI_MODEL,
 
-                    contents=prompt,
+                    contents=
+                        prompt,
 
                     config=
-                    types.GenerateContentConfig(
+                        types.GenerateContentConfig(
 
-                        response_mime_type=
-                            "application/json",
+                            response_mime_type=
+                                "application/json",
 
-                        response_json_schema=
-                            SUMMARY_SCHEMA,
+                            response_json_schema=
+                                SUMMARY_SCHEMA,
 
-                        thinking_config=
-                            types.ThinkingConfig(
+                            thinking_config=
+                                types.ThinkingConfig(
 
-                                thinking_level=
-                                    types.ThinkingLevel.MEDIUM
-                            ),
-                    ),
+                                    thinking_level=
+                                        types.ThinkingLevel.MEDIUM
+                                ),
+                        ),
                 )
             )
 
 
-            last_raw_text = clean_string(
-                getattr(
-                    response,
-                    "text",
-                    ""
+            last_raw_text = (
+                clean_string(
+                    getattr(
+                        response,
+                        "text",
+                        ""
+                    )
                 )
             )
 
 
-            result = parse_response(
-                response
+            parsed = (
+                parse_response(
+                    response
+                )
             )
 
 
-            result = validate_result(
-                result=result,
-                selected_month_order=
-                    selected_month_order,
+            validated = (
+                validate_result(
+
+                    result=
+                        parsed,
+
+                    selected_month_order=
+                        selected_month_order,
+                )
             )
 
 
             return (
-                result,
+                validated,
                 attempt,
                 last_raw_text,
                 "",
@@ -1524,7 +1895,8 @@ def generate_one_summary(
 
 
             print(
-                f"      Attempt {attempt} failed: "
+                f"      Attempt "
+                f"{attempt} failed: "
                 f"{last_error}"
             )
 
@@ -1545,9 +1917,7 @@ def generate_one_summary(
 
 
 # ============================================================
-# BUILD FULL SUMMARY
-#
-# Kept for easy validation and optional SAC use.
+# FULL SUMMARY
 # ============================================================
 
 def build_full_summary(
@@ -1576,17 +1946,8 @@ def build_full_summary(
 
 
 # ============================================================
-# OUTPUT KEY
+# KEYS
 # ============================================================
-
-KEY_COLUMNS = [
-
-    "Fiscal_Year",
-    "Month",
-    "Entity_CD",
-    "Currency",
-]
-
 
 def make_key(
     fiscal_year,
@@ -1596,10 +1957,22 @@ def make_key(
 ):
 
     return (
-        int(fiscal_year),
-        clean_string(month),
-        clean_string(entity_cd),
-        clean_string(currency),
+
+        int(
+            fiscal_year
+        ),
+
+        clean_string(
+            month
+        ),
+
+        clean_string(
+            entity_cd
+        ),
+
+        clean_string(
+            currency
+        ),
     )
 
 
@@ -1629,7 +2002,7 @@ def load_existing_output():
 
 
 # ============================================================
-# REMOVE EXISTING KEY BEFORE REPLACEMENT
+# REMOVE OLD KEY
 # ============================================================
 
 def remove_existing_key(
@@ -1642,10 +2015,16 @@ def remove_existing_key(
         return df
 
 
-    fiscal_year, month, entity_cd, currency = key
+    (
+        fiscal_year,
+        month,
+        entity_cd,
+        currency,
+    ) = key
 
 
     mask = ~(
+
         (
             pd.to_numeric(
                 df[
@@ -1656,7 +2035,9 @@ def remove_existing_key(
             ==
             fiscal_year
         )
+
         &
+
         (
             df[
                 "Month"
@@ -1664,7 +2045,9 @@ def remove_existing_key(
             ==
             month
         )
+
         &
+
         (
             df[
                 "Entity_CD"
@@ -1672,7 +2055,9 @@ def remove_existing_key(
             ==
             entity_cd
         )
+
         &
+
         (
             df[
                 "Currency"
@@ -1752,24 +2137,32 @@ def append_log(
     if LOG_FILE.exists():
 
         log_df.to_csv(
+
             LOG_FILE,
+
             mode="a",
+
             index=False,
+
             header=False,
+
             encoding="utf-8-sig",
         )
 
     else:
 
         log_df.to_csv(
+
             LOG_FILE,
+
             index=False,
+
             encoding="utf-8-sig",
         )
 
 
 # ============================================================
-# SAVE FAILED RAW RESPONSE
+# SAVE FAILED RESPONSE
 # ============================================================
 
 def save_failed_response(
@@ -1784,14 +2177,28 @@ def save_failed_response(
     )
 
 
-    fiscal_year, month, entity_cd, currency = key
+    (
+        fiscal_year,
+        month,
+        entity_cd,
+        currency,
+    ) = key
 
 
     safe_entity = (
         entity_cd
-        .replace("/", "_")
-        .replace("\\", "_")
-        .replace(".", "_")
+        .replace(
+            "/",
+            "_"
+        )
+        .replace(
+            "\\",
+            "_"
+        )
+        .replace(
+            ".",
+            "_"
+        )
     )
 
 
@@ -1810,24 +2217,24 @@ def save_failed_response(
     )
 
 
-    content = (
-        f"ERROR\n"
-        f"=====\n"
-        f"{error}\n\n"
-        f"RAW GEMINI RESPONSE\n"
-        f"===================\n"
-        f"{raw_response}"
-    )
-
-
     path.write_text(
-        content,
+
+        (
+            "ERROR\n"
+            "=====\n"
+            f"{error}\n\n"
+
+            "RAW GEMINI RESPONSE\n"
+            "===================\n"
+            f"{raw_response}"
+        ),
+
         encoding="utf-8",
     )
 
 
 # ============================================================
-# BUILD FINAL OUTPUT ROW
+# BUILD FINAL ROW
 # ============================================================
 
 def build_output_row(
@@ -1848,6 +2255,11 @@ def build_output_row(
         build_full_summary(
             result
         )
+    )
+
+
+    total_words = word_count(
+        full_summary
     )
 
 
@@ -1895,9 +2307,10 @@ def build_output_row(
                 ]
             ),
 
-        # ==============================================
+
+        # ====================================================
         # EXECUTIVE
-        # ==============================================
+        # ====================================================
 
         "Executive_Point_1":
             result[
@@ -1909,9 +2322,10 @@ def build_output_row(
                 "executive_point_2"
             ],
 
-        # ==============================================
+
+        # ====================================================
         # KEY MOVEMENTS
-        # ==============================================
+        # ====================================================
 
         "Key_Movement_1":
             result[
@@ -1933,9 +2347,10 @@ def build_output_row(
                 "key_movement_4"
             ],
 
-        # ==============================================
+
+        # ====================================================
         # TREND
-        # ==============================================
+        # ====================================================
 
         "Trend_Point_1":
             result[
@@ -1947,9 +2362,10 @@ def build_output_row(
                 "trend_point_2"
             ],
 
-        # ==============================================
-        # BUDGET / YTD
-        # ==============================================
+
+        # ====================================================
+        # BUDGET & YTD
+        # ====================================================
 
         "Budget_YTD_Point_1":
             result[
@@ -1961,12 +2377,16 @@ def build_output_row(
                 "budget_ytd_point_2"
             ],
 
-        # ==============================================
-        # FULL SUMMARY
-        # ==============================================
+
+        # ====================================================
+        # VALIDATION / DEBUG
+        # ====================================================
 
         "Summary_Full":
             full_summary,
+
+        "Word_Count":
+            total_words,
 
         "Generation_Status":
             "PASS",
@@ -2003,11 +2423,11 @@ def run_generation(
     )
 
     print(
-        "CASHFLOW AI - ITERATION 2"
+        "CASHFLOW AI - ITERATION 2 FINAL"
     )
 
     print(
-        "RICH STRUCTURED COMMENTARY GENERATION"
+        "RICH POPUP COMMENTARY"
     )
 
     print(
@@ -2016,7 +2436,8 @@ def run_generation(
 
 
     print(
-        f"\nModel: {GEMINI_MODEL}"
+        f"\nModel: "
+        f"{GEMINI_MODEL}"
     )
 
     print(
@@ -2024,7 +2445,19 @@ def run_generation(
     )
 
     print(
-        "Output mode: Schema-enforced JSON"
+        "Currency-aware: YES"
+    )
+
+    print(
+        "Structured output: YES"
+    )
+
+    print(
+        "Quality validation: YES"
+    )
+
+    print(
+        "Safe percentage handling: YES"
     )
 
 
@@ -2039,21 +2472,28 @@ def run_generation(
 
 
     # ========================================================
-    # AVAILABLE SUMMARY KEYS
+    # SUMMARY KEYS
     # ========================================================
 
     summary_keys = (
         insight_df[
             [
                 "Fiscal_Year",
+
                 "Selected_Month",
+
                 "Selected_Month_Order",
+
                 "Entity_CD",
+
                 "Entity_Name",
+
                 "Currency",
             ]
         ]
+
         .drop_duplicates()
+
         .sort_values(
             [
                 "Selected_Month_Order",
@@ -2066,11 +2506,16 @@ def run_generation(
                 True,
             ],
         )
+
         .reset_index(
             drop=True
         )
     )
 
+
+    # ========================================================
+    # OPTIONAL FILTERS
+    # ========================================================
 
     if currency_filter:
 
@@ -2078,7 +2523,8 @@ def run_generation(
             summary_keys[
                 summary_keys[
                     "Currency"
-                ].str.upper()
+                ]
+                .str.upper()
                 ==
                 currency_filter.upper()
             ]
@@ -2148,16 +2594,21 @@ def run_generation(
         ):
 
             existing_keys.add(
+
                 make_key(
+
                     row[
                         "Fiscal_Year"
                     ],
+
                     row[
                         "Month"
                     ],
+
                     row[
                         "Entity_CD"
                     ],
+
                     row[
                         "Currency"
                     ],
@@ -2165,16 +2616,8 @@ def run_generation(
             )
 
 
-    # ========================================================
-    # CLIENT
-    # ========================================================
-
     client = create_client()
 
-
-    # ========================================================
-    # COUNTERS
-    # ========================================================
 
     generated = 0
     skipped = 0
@@ -2187,7 +2630,7 @@ def run_generation(
 
 
     # ========================================================
-    # GENERATE
+    # LOOP
     # ========================================================
 
     for position, (
@@ -2204,11 +2647,13 @@ def run_generation(
             ]
         )
 
+
         month = clean_string(
             key_row[
                 "Selected_Month"
             ]
         )
+
 
         month_order = int(
             key_row[
@@ -2216,17 +2661,20 @@ def run_generation(
             ]
         )
 
+
         entity_cd = clean_string(
             key_row[
                 "Entity_CD"
             ]
         )
 
+
         entity_name = clean_string(
             key_row[
                 "Entity_Name"
             ]
         )
+
 
         currency = clean_string(
             key_row[
@@ -2252,7 +2700,7 @@ def run_generation(
 
 
         # ====================================================
-        # SKIP EXISTING
+        # SKIP
         # ====================================================
 
         if (
@@ -2271,7 +2719,7 @@ def run_generation(
 
 
         # ====================================================
-        # CURRENT INSIGHTS
+        # CURRENT FACTS
         # ====================================================
 
         insight_subset = (
@@ -2283,7 +2731,9 @@ def run_generation(
                     ==
                     fiscal_year
                 )
+
                 &
+
                 (
                     insight_df[
                         "Selected_Month"
@@ -2291,7 +2741,9 @@ def run_generation(
                     ==
                     month
                 )
+
                 &
+
                 (
                     insight_df[
                         "Entity_CD"
@@ -2299,7 +2751,9 @@ def run_generation(
                     ==
                     entity_cd
                 )
+
                 &
+
                 (
                     insight_df[
                         "Currency"
@@ -2313,7 +2767,7 @@ def run_generation(
 
 
         # ====================================================
-        # TREND
+        # TREND FACTS
         # ====================================================
 
         trend_subset = (
@@ -2325,7 +2779,9 @@ def run_generation(
                     ==
                     fiscal_year
                 )
+
                 &
+
                 (
                     trend_df[
                         "Selected_Month"
@@ -2333,7 +2789,9 @@ def run_generation(
                     ==
                     month
                 )
+
                 &
+
                 (
                     trend_df[
                         "Entity_CD"
@@ -2341,7 +2799,9 @@ def run_generation(
                     ==
                     entity_cd
                 )
+
                 &
+
                 (
                     trend_df[
                         "Currency"
@@ -2357,7 +2817,7 @@ def run_generation(
         if insight_subset.empty:
 
             print(
-                "    FAILED - no structured insight facts"
+                "    FAILED - no insight facts"
             )
 
             failures += 1
@@ -2371,8 +2831,10 @@ def run_generation(
 
         fact_package = (
             build_fact_package(
+
                 insight_subset=
                     insight_subset,
+
                 trend_subset=
                     trend_subset,
             )
@@ -2380,7 +2842,7 @@ def run_generation(
 
 
         # ====================================================
-        # GEMINI
+        # GENERATE
         # ====================================================
 
         (
@@ -2389,8 +2851,13 @@ def run_generation(
             raw_response,
             error,
         ) = generate_one_summary(
-            client=client,
-            fact_package=fact_package,
+
+            client=
+                client,
+
+            fact_package=
+                fact_package,
+
             selected_month_order=
                 month_order,
         )
@@ -2423,10 +2890,15 @@ def run_generation(
 
 
             save_failed_response(
-                key=key,
+
+                key=
+                    key,
+
                 raw_response=
                     raw_response,
-                error=error,
+
+                error=
+                    error,
             )
 
 
@@ -2470,23 +2942,27 @@ def run_generation(
         # SUCCESS
         # ====================================================
 
-        print(
-            f"    PASS "
-            f"(attempt {attempts})"
-        )
-
-
         output_row = (
             build_output_row(
+
                 first_row=
                     insight_subset.iloc[0],
-                result=result,
-                attempts=attempts,
+
+                result=
+                    result,
+
+                attempts=
+                    attempts,
             )
         )
 
 
-        # Remove prior version if --force.
+        print(
+            f"    PASS "
+            f"(attempt {attempts}, "
+            f"{output_row['Word_Count']} words)"
+        )
+
 
         output_df = (
             remove_existing_key(
@@ -2499,6 +2975,7 @@ def run_generation(
         output_df = pd.concat(
             [
                 output_df,
+
                 pd.DataFrame(
                     [
                         output_row
@@ -2549,6 +3026,11 @@ def run_generation(
                 "Issue":
                     "",
 
+                "Word_Count":
+                    output_row[
+                        "Word_Count"
+                    ],
+
                 "Generated_At":
                     generated_at,
             }
@@ -2556,7 +3038,7 @@ def run_generation(
 
 
     # ========================================================
-    # FINAL STATUS
+    # END
     # ========================================================
 
     print(
@@ -2566,7 +3048,7 @@ def run_generation(
     )
 
     print(
-        "ITERATION-2 GENERATION COMPLETE"
+        "ITERATION-2 FULL GENERATION COMPLETE"
     )
 
     print(
@@ -2575,20 +3057,23 @@ def run_generation(
 
 
     print(
-        f"\nGenerated: {generated}"
+        f"\nGenerated: "
+        f"{generated}"
     )
 
     print(
-        f"Skipped:   {skipped}"
+        f"Skipped:   "
+        f"{skipped}"
     )
 
     print(
-        f"Failures:  {failures}"
+        f"Failures:  "
+        f"{failures}"
     )
 
 
     print(
-        "\nOutput:"
+        "\nFinal Output:"
     )
 
     print(
@@ -2597,7 +3082,7 @@ def run_generation(
 
 
     print(
-        "\nLog:"
+        "\nGeneration Log:"
     )
 
     print(
@@ -2608,7 +3093,7 @@ def run_generation(
     if failures > 0:
 
         print(
-            "\nRaw failed responses:"
+            "\nFailed response details:"
         )
 
         print(
@@ -2624,8 +3109,8 @@ def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Generate Iteration-2 rich "
-            "Cashflow AI commentary."
+            "Generate final Iteration-2 "
+            "Cashflow AI popup commentary."
         )
     )
 
@@ -2634,20 +3119,12 @@ def main():
         "--limit",
         type=int,
         default=None,
-        help=(
-            "Generate only the first N "
-            "summary combinations."
-        ),
     )
 
 
     parser.add_argument(
         "--force",
         action="store_true",
-        help=(
-            "Regenerate combinations that "
-            "already exist."
-        ),
     )
 
 
@@ -2659,9 +3136,6 @@ def main():
             "EUR",
             "LC",
         ],
-        help=(
-            "Optional currency filter."
-        ),
     )
 
 
@@ -2669,9 +3143,6 @@ def main():
         "--entity",
         type=str,
         default=None,
-        help=(
-            "Optional entity-name search."
-        ),
     )
 
 
@@ -2679,10 +3150,16 @@ def main():
 
 
     run_generation(
-        limit=args.limit,
-        force=args.force,
+
+        limit=
+            args.limit,
+
+        force=
+            args.force,
+
         currency_filter=
             args.currency,
+
         entity_filter=
             args.entity,
     )
